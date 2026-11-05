@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Orexa Downloader</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="dialog.css">
+</head>
+<body>
+  <main id="app">
+    <header class="brand">
+      <img src="icons/symbol.svg" alt="" width="28" height="26">
+      <span>Orexa Downloader</span>
+    </header>
+
+    <section class="title">
+      <h1 id="title">Download file info</h1>
+      <p id="subtitle" class="muted">Choose what to do with this file.</p>
+    </section>
+
+    <section id="card" class="card" aria-live="polite"></section>
+
+    <section id="quality" class="quality" hidden>
+      <label class="label">Quality</label>
+      <div id="chips" class="chips" role="radiogroup" aria-label="Quality"></div>
+      <p id="sizeLine" class="muted small"></p>
+    </section>
+
+    <section id="nameField" class="field">
+      <label class="label" for="saveAs">Save as</label>
+      <div class="input">
+        <span class="ico" id="nameIcon"></span>
+        <input id="saveAs" type="text" dir="auto" spellcheck="false">
+      </div>
+    </section>
+
+    <section class="field">
+      <label class="label" for="saveTo">Save to</label>
+      <div class="row">
+        <div class="input grow">
+          <span class="ico" id="folderIcon"></span>
+          <input id="saveTo" type="text" spellcheck="false">
+        </div>
+        <button id="change" type="button" class="btn">Change</button>
+      </div>
+    </section>
+
+    <div class="from"><span class="muted">From</span><span id="host" class="host"></span></div>
+
+    <div id="note" class="note" hidden>
+      <span class="ico" id="noteIcon"></span>
+      <span id="noteText"></span>
+    </div>
+
+    <p id="error" class="error" role="alert" hidden></p>
+
+    <footer class="footer">
+      <button id="cancel" type="button" class="btn ghost">Cancel</button>
+      <button id="chrome" type="button" class="btn ghost" hidden>Download with Chrome</button>
+      <span class="spacer"></span>
+      <button id="queue" type="button" class="btn"><span class="ico" id="queueIcon"></span>Add to queue</button>
+      <button id="now" type="button" class="btn primary"><span class="ico" id="nowIcon"></span>Download now</button>
+    </footer>
+  </main>
+  <script src="dialog-logic.js"></script>
+  <script src="dialog.js"></script>
+</body>
+</html>

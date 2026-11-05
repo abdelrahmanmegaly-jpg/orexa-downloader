@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Orexa Downloader</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/icon48.png" alt="" width="36" height="36">
+    <div>
+      <h1>Orexa Downloader</h1>
+      <p id="status" class="muted">Checking connection...</p>
+    </div>
+  </header>
+
+  <label class="row switch">
+    <span>
+      <strong>Catch downloads</strong>
+      <small class="muted">Send files you click to Orexa</small>
+    </span>
+    <input type="checkbox" id="enabled">
+  </label>
+
+  <label class="row switch" style="margin-top:8px">
+    <span>
+      <strong>Find videos on pages</strong>
+      <small class="muted">Show a Download button on videos</small>
+    </span>
+    <input type="checkbox" id="sniff">
+  </label>
+
+  <section id="foundBox" hidden>
+    <h2>Playing on this page</h2>
+    <ul id="found"></ul>
+  </section>
+
+  <div class="buttons">
+    <button id="send" class="primary">Send this page</button>
+    <button id="open">Open Orexa</button>
+  </div>
+
+  <details>
+    <summary>Options</summary>
+    <label class="field">Only files bigger than (MB)
+      <input type="number" id="minSizeMB" min="0" step="1">
+    </label>
+    <label class="field">Only these file types
+      <input type="text" id="onlyTypes" placeholder="zip, exe, mp4 (empty = all)">
+    </label>
+    <label class="field">Never catch on these sites
+      <input type="text" id="skipSites" placeholder="example.com, intranet.local">
+    </label>
+  </details>
+
+  <section>
+    <h2>Recently sent</h2>
+    <ul id="recent"><li class="muted">Nothing yet</li></ul>
+  </section>
+
+  <script src="popup.js"></script>
+</body>
+</html>

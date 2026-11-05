@@ -1,0 +1,54 @@
+:root {
+  --navy: #0b1220;
+  --aqua: #22d3ee;
+  --mint: #cffafe;
+  --gray: #e2e8f0;
+  --muted: #60717e;
+  --ok: #067647;
+  --bad: #b42318;
+}
+* { box-sizing: border-box; }
+body {
+  width: 340px;
+  margin: 0;
+  padding: 16px;
+  color: var(--navy);
+  background: #fff;
+  font: 14px/1.4 "Segoe UI", Roboto, Arial, sans-serif;
+}
+header { display: flex; gap: 12px; align-items: center; margin-bottom: 14px; }
+h1 { margin: 0; font-size: 17px; }
+h2 { margin: 14px 0 6px; font-size: 13px; color: var(--muted); font-weight: 600; }
+p { margin: 2px 0 0; }
+.muted { color: var(--muted); }
+small { display: block; font-size: 12px; }
+.row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 12px; border: 1px solid var(--gray); border-radius: 12px; }
+.row input[type="checkbox"] { width: 40px; height: 22px; accent-color: var(--aqua); cursor: pointer; }
+.buttons { display: flex; gap: 8px; margin: 12px 0; }
+button {
+  flex: 1;
+  padding: 10px 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 10px;
+  background: #fff;
+  color: var(--navy);
+  font: 600 14px "Segoe UI", Roboto, Arial, sans-serif;
+  cursor: pointer;
+}
+button:hover { background: #f1f5f9; }
+button.primary { background: var(--aqua); border-color: var(--aqua); }
+button.primary:hover { background: #1fc0da; }
+details { margin-top: 4px; }
+summary { cursor: pointer; color: var(--muted); font-size: 13px; padding: 4px 0; }
+.field { display: block; margin: 8px 0; font-size: 12px; color: var(--muted); }
+.field input { display: block; width: 100%; margin-top: 4px; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 8px; font: 13px "Segoe UI", Roboto, Arial, sans-serif; color: var(--navy); }
+.field input:focus { outline: 2px solid var(--aqua); border-color: transparent; }
+ul { list-style: none; margin: 0; padding: 0; }
+li { padding: 6px 0; border-bottom: 1px solid var(--gray); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+li:last-child { border-bottom: none; }
+li.found { display: flex; align-items: center; gap: 8px; }
+.fname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+button.mini { flex: none; padding: 5px 10px; font-size: 12px; background: var(--aqua); border-color: var(--aqua); }
+button.mini:hover { background: #1fc0da; }
+.ok { color: var(--ok); }
+.bad { color: var(--bad); }

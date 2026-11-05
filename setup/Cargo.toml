@@ -1,0 +1,21 @@
+[package]
+name = "orexa-setup"
+version = "0.1.5"
+edition = "2021"
+description = "Orexa Downloader Setup"
+
+[dependencies]
+eframe = "0.29"
+image = { version = "0.25", default-features = false, features = ["png"] }
+rfd = "0.15"
+flate2 = "1"
+
+[build-dependencies]
+winresource = "0.1"
+flate2 = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

@@ -1,0 +1,33 @@
+[package]
+name = "orexa-downloader"
+version = "0.1.5"
+edition = "2021"
+description = "Orexa Downloader"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+egui_extras = { version = "0.29", features = ["svg"] }
+reqwest = { version = "0.12", features = ["blocking"] }
+chrono = "0.4"
+image = "0.25"
+rfd = "0.15"
+file_icon_provider = "1.0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tray-icon = "0.19"
+tauri-winrt-notification = "0.7"
+arboard = "3"
+sha2 = "0.10"
+ar-reshaper = "1.5"
+unicode-bidi = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+librqbit = "9.1"
+resvg = { version = "0.37", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
+
+[build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 2
