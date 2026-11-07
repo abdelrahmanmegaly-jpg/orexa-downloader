@@ -116,12 +116,19 @@
     return i > 0 ? n.slice(0, i) : n;
   }
 
+  /** Which kind of file this is, for choosing a folder: Video, Music, Compressed, Torrent... */
+  function folderKey(name, { video = false, audio = false, torrent = false } = {}) {
+    if (torrent) return "Torrent";
+    if (video) return audio ? "Music" : "Video";
+    return categoryOf(name).label;
+  }
+
   /** A magnet link or a .torrent file. */
   function isTorrent(url, name) {
     return /^magnet:\?/i.test(String(url || "").trim()) || extOf(name) === "torrent" || /\.torrent$/i.test(String(url || "").split(/[?#]/)[0]);
   }
 
-  const api = { isTorrent, extOf, categoryOf, fmtSize, fmtClock, cleanName, nameFromUrl, hostOf, youtubeId, defaultChoices, keepChoice, stemOf };
+  const api = { folderKey, isTorrent, extOf, categoryOf, fmtSize, fmtClock, cleanName, nameFromUrl, hostOf, youtubeId, defaultChoices, keepChoice, stemOf };
   if (typeof module !== "undefined") module.exports = api;
   else root.OrexaLogic = api;
 })(typeof self !== "undefined" ? self : this);

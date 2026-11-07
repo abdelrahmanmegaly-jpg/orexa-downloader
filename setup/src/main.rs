@@ -358,6 +358,37 @@ fn uninstall(dir: &Path, purge: bool, test: bool) {
         let _ = hidden("reg").args(["delete", KEY, "/f"]).status();
         let _ = hidden("reg").args(["delete", OLD_USER_KEY, "/f"]).status();
         let _ = hidden("netsh").args(["advfirewall", "firewall", "delete", "rule", "name=Orexa Downloader"]).status();
+        // No longer open magnet links and .torrent files.
+        for key in [
+            r"HKCU\Software\Classes\Orexa.Magnet",
+            r"HKCU\Software\Classes\Orexa.Torrent",
+            r"HKCU\Software\Orexa",
+        ] {
+            let _ = hidden("reg").args(["delete", key, "/f"]).status();
+        }
+        let _ = hidden("reg")
+            .args(["delete", r"HKCU\Software\RegisteredApplications", "/v", "Orexa Downloader", "/f"])
+            .status();
+        let _ = hidden("reg")
+            .args(["delete", r"HKCU\Software\Classes\.torrent\OpenWithProgids", "/v", "Orexa.Torrent", "/f"])
+            .status();
+        // The direct handlers Orexa may have set (only if they are Orexa's).
+        let direct_magnet = hidden("reg")
+            .args(["query", r"HKCU\Software\Classes\magnet\shell\open\command", "/ve"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("orexa-downloader"))
+            .unwrap_or(false);
+        if direct_magnet {
+            let _ = hidden("reg").args(["delete", r"HKCU\Software\Classes\magnet", "/f"]).status();
+        }
+        let direct_torrent = hidden("reg")
+            .args(["query", r"HKCU\Software\Classes\.torrent", "/ve"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("Orexa.Torrent"))
+            .unwrap_or(false);
+        if direct_torrent {
+            let _ = hidden("reg").args(["delete", r"HKCU\Software\Classes\.torrent", "/ve", "/f"]).status();
+        }
         // No longer start with Windows.
         let _ = hidden("reg")
             .args(["delete", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run", "/v", "Orexa Downloader", "/f"])

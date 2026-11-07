@@ -135,6 +135,16 @@ pub fn run(
     let alive = Arc::new(AtomicBool::new(true));
 
     let threads = CONNECTIONS.min(n);
+    let already = total_got.load(Ordering::Relaxed);
+    let _ = ev_tx.send(EngineEvent::Log(
+        d.id,
+        if already > 0 {
+            format!("Continued with {} connections, {}% was already saved", threads, (already * 100 / size.max(1)))
+        } else {
+            format!("Started with {} connections, the file is split into {} parts", threads, n)
+        },
+    ));
+    let _ = ev_tx.send(EngineEvent::Conns(d.id, threads));
     for _ in 0..threads {
         let (done, total_got, claimed, control, failed, finished_threads) = (
             done.clone(),
@@ -144,9 +154,9 @@ pub fn run(
             failed.clone(),
             finished_threads.clone(),
         );
-        let (client, d, path, side) = (client.clone(), d.clone(), path.to_path_buf(), side.clone());
+        let (client, d, path, side, ev) = (client.clone(), d.clone(), path.to_path_buf(), side.clone(), ev_tx.clone());
         thread::spawn(move || {
-            worker(&client, &d, &path, &side, &done, &total_got, &claimed, &control, &failed);
+            worker(&client, &d, &path, &side, &done, &total_got, &claimed, &control, &failed, &ev);
             finished_threads.fetch_add(1, Ordering::SeqCst);
         });
     }
@@ -158,6 +168,7 @@ pub fn run(
     let mut window_start = Instant::now();
     let mut window_bytes = total_got.load(Ordering::Relaxed);
     let mut speed = 0.0f64;
+    let mut last_conns = threads;
     let snapshot = |side: &mut Side| {
         for (i, v) in done.iter().enumerate() {
             side.done[i] = v.load(Ordering::Relaxed);
@@ -232,6 +243,11 @@ pub fn run(
         if last_report.elapsed() > Duration::from_millis(200) {
             last_report = Instant::now();
             let _ = ev_tx.send(EngineEvent::Progress(d.id, got, size, speed));
+            let live = (threads as u64).saturating_sub(finished_threads.load(Ordering::SeqCst)) as usize;
+            if live != last_conns && control.load(Ordering::SeqCst) == RUN {
+                last_conns = live;
+                let _ = ev_tx.send(EngineEvent::Conns(d.id, live));
+            }
         }
         if last_save.elapsed() > Duration::from_secs(2) {
             last_save = Instant::now();
@@ -253,6 +269,7 @@ fn worker(
     claimed: &Mutex<Vec<bool>>,
     control: &AtomicU8,
     failed: &Mutex<Option<String>>,
+    ev: &Sender<EngineEvent>,
 ) {
     let Ok(file) = OpenOptions::new().write(true).open(path) else {
         *failed.lock().unwrap() = Some("Could not open the file".into());
@@ -297,6 +314,10 @@ fn worker(
                 break;
             }
             attempts += 1;
+            let _ = ev.send(EngineEvent::Log(
+                d.id,
+                format!("Part {} was interrupted, trying again ({} of {})", idx + 1, attempts, RETRIES),
+            ));
             if attempts > RETRIES {
                 *failed.lock().unwrap() = Some("The connection kept failing. Try again.".into());
                 return;
@@ -426,6 +447,9 @@ mod tests {
             error: None,
             source: crate::Source::Http,
             thumb: None,
+            files: None,
+            seeding: None,
+            live: Default::default(),
             extra: Default::default(),
         }
     }

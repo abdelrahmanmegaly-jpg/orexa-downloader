@@ -2,6 +2,9 @@
 target/
 dist/
 
+# Arabic interface font (licensed for use inside the app, not for redistribution as files)
+app/assets/fonts/
+
 # Editors / OS
 .vscode/
 .idea/

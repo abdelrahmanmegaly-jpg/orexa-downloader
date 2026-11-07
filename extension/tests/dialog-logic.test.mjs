@@ -89,4 +89,16 @@ test("torrents: magnet names, type and detection", () => {
   assert.equal(L.isTorrent("https://x.org/a.zip", "a.zip"), false);
 });
 
+test("folder choice follows the kind of file", () => {
+  assert.equal(L.folderKey("movie.mp4"), "Video");
+  assert.equal(L.folderKey("song.mp3"), "Music");
+  assert.equal(L.folderKey("bundle.zip"), "Compressed");
+  assert.equal(L.folderKey("setup.exe"), "Programs");
+  assert.equal(L.folderKey("report.pdf"), "Documents");
+  assert.equal(L.folderKey("mystery.xyz"), "Other");
+  assert.equal(L.folderKey("Sintel", { torrent: true }), "Torrent");
+  assert.equal(L.folderKey("clip", { video: true }), "Video");
+  assert.equal(L.folderKey("clip", { video: true, audio: true }), "Music");
+});
+
 console.log(`\n${n} tests passed`);

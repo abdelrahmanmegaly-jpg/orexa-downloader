@@ -120,6 +120,32 @@ fn probe_cached(id: &str, read: impl FnOnce() -> Value) -> Value {
     v
 }
 
+/// Windows opened a magnet link or a .torrent file with Orexa: leave it for the app (already
+/// running, or starting right now) to show in its Add window.
+pub fn hand_over(link: &str) {
+    let link = if torrent::is_torrent_file(link) {
+        std::fs::canonicalize(link)
+            .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+            .unwrap_or_else(|_| link.to_string())
+    } else {
+        link.to_string()
+    };
+    let dir = inbox_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!("{}-os.tmp", stamp));
+    let fin = dir.join(format!("{}-os.json", stamp));
+    let msg = json!({"type": "open", "url": link, "ask": true});
+    if fs::write(&tmp, msg.to_string()).is_ok() {
+        let _ = fs::rename(&tmp, &fin);
+    }
+}
+
 /// Handle one message from the browser and return the reply.
 pub fn handle(raw: &[u8]) -> Value {
     let Ok(msg) = serde_json::from_slice::<Value>(raw) else {
@@ -145,9 +171,21 @@ pub fn handle(raw: &[u8]) -> Value {
                 st.default_dir.clone()
             };
             let running = st.downloads.iter().filter(|d| d.status == "downloading").count();
+            // With "sort into folders" on, say where each kind of file goes, so the window can show it.
+            let folders = if st.organize {
+                let sub = |name: &str| PathBuf::from(&default_dir).join(name).to_string_lossy().into_owned();
+                json!({
+                    "Compressed": sub("Compressed"), "Documents": sub("Documents"), "Music": sub("Music"),
+                    "Programs": sub("Programs"), "Video": sub("Videos"), "Torrent": sub("Torrents"), "Other": sub("Other"),
+                })
+            } else {
+                Value::Null
+            };
             json!({
                 "ok": true,
                 "defaultDir": default_dir,
+                "organize": st.organize,
+                "folders": folders,
                 "running": running,
                 "ffmpeg": youtube::ffmpeg_path().is_some(),
                 "ytdlp": youtube::ytdlp_path().is_some(),

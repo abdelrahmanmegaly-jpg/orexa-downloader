@@ -49,6 +49,9 @@ pub struct SavedDownload {
     pub referer: Option<String>,
     #[serde(default)]
     pub torrent: bool,
+    /// A torrent: the files chosen for download (None = all).
+    #[serde(default)]
+    pub torrent_files: Option<Vec<usize>>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -67,6 +70,24 @@ pub struct SavedState {
     /// Start in the tray when Windows starts.
     #[serde(default = "yes")]
     pub autostart: bool,
+    /// Put new downloads in a folder for their type.
+    #[serde(default)]
+    pub organize: bool,
+    /// Keep sharing a torrent after it finishes.
+    #[serde(default)]
+    pub seed_after: bool,
+    /// Open magnet links and .torrent files with Orexa.
+    #[serde(default = "yes")]
+    pub handle_types: bool,
+    /// Interface language code ("en", "ar").
+    #[serde(default)]
+    pub language: String,
+    /// The first-run welcome has been seen. Older state files count as seen.
+    #[serde(default = "yes")]
+    pub welcomed: bool,
+    /// What to do when every download has finished: "", "folder" or "sleep".
+    #[serde(default)]
+    pub after_finish: String,
 }
 
 fn yes() -> bool {
@@ -77,6 +98,11 @@ impl Default for SavedWindow {
     fn default() -> Self {
         Self { w: 1280.0, h: 800.0, maximized: false }
     }
+}
+
+/// Has Orexa been run before (is there a saved state)?
+pub fn exists() -> bool {
+    state_path().exists()
 }
 
 pub fn load() -> Option<SavedState> {
@@ -112,6 +138,7 @@ impl SavedDownload {
                 Source::Http | Source::Torrent => None,
             },
             torrent: matches!(d.source, Source::Torrent),
+            torrent_files: d.files.clone(),
         }
     }
 
@@ -142,6 +169,9 @@ impl SavedDownload {
             error: self.error,
             source,
             thumb: load_thumb(self.id),
+            files: self.torrent_files,
+            seeding: None,
+            live: Default::default(),
             extra: Extra { referer: self.referer, ..Extra::default() },
         };
         if d.status == Status::Complete {
@@ -195,6 +225,13 @@ impl App {
         self.tray_hint_shown = st.tray_hint_shown;
         self.browser_ask = st.browser_ask;
         self.autostart = st.autostart;
+        self.organize = st.organize;
+        self.seed_after = st.seed_after;
+        self.handle_types = st.handle_types;
+        self.lang = i18n::Lang::from_code(&st.language);
+        i18n::set(self.lang);
+        self.welcomed = st.welcomed;
+        self.after_finish = AfterFinish::from_code(&st.after_finish);
         self.downloads = st.downloads.into_iter().map(|d| d.into_download()).collect();
         let top = self.downloads.iter().map(|d| d.id).max().unwrap_or(0);
         self.next_id = st.next_id.max(top + 1).max(100);
@@ -239,6 +276,12 @@ impl App {
             tray_hint_shown: self.tray_hint_shown,
             browser_ask: self.browser_ask,
             autostart: self.autostart,
+            organize: self.organize,
+            seed_after: self.seed_after,
+            handle_types: self.handle_types,
+            language: self.lang.code().to_string(),
+            welcomed: self.welcomed,
+            after_finish: self.after_finish.code().to_string(),
         };
         let Ok(json) = serde_json::to_string_pretty(&st) else { return };
         if json == self.last_json {
@@ -273,6 +316,7 @@ mod tests {
             yt: None,
             referer: None,
             torrent: false,
+            torrent_files: None,
         }
     }
 
@@ -304,6 +348,12 @@ mod tests {
             tray_hint_shown: false,
             browser_ask: false,
             autostart: true,
+            organize: false,
+            seed_after: false,
+            handle_types: true,
+            language: "ar".into(),
+            welcomed: true,
+            after_finish: "sleep".into(),
         };
         let json = serde_json::to_string(&st).unwrap();
         let back: SavedState = serde_json::from_str(&json).unwrap();
@@ -313,5 +363,8 @@ mod tests {
         // An older or partial file must still load.
         let partial: SavedState = serde_json::from_str(r#"{"dark":true}"#).unwrap();
         assert!(partial.dark && partial.downloads.is_empty());
+        // A file from before the welcome existed must not greet a returning user again.
+        assert!(partial.welcomed);
+        assert_eq!(partial.after_finish, "");
     }
 }

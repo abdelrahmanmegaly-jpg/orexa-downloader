@@ -26,6 +26,19 @@
   let isYt = false; // the video layout (quality buttons): YouTube and HLS/DASH streams
   let isStream = false;
   let isTorrent = false;
+  let folders = null; // where each kind of file goes, when Orexa sorts into folders
+  let folderTouched = false; // the person chose the folder themselves
+
+  /** Show the folder for this kind of file (only while the person has not chosen one). */
+  function autoFolder() {
+    if (!folders || folderTouched) return;
+    const key = L.folderKey($("saveAs").value || L.nameFromUrl(data.url), {
+      video: isYt,
+      audio: !!(yt && yt.choices && yt.choices[chosen] && yt.choices[chosen].audio),
+      torrent: isTorrent,
+    });
+    if (folders[key]) $("saveTo").value = folders[key];
+  }
   let acting = false;
   let yt = null; // video details from Orexa
   let chosen = 0;
@@ -84,6 +97,7 @@
   function renderFileCard(extraNote) {
     const name = $("saveAs").value || L.nameFromUrl(data.url);
     const cat = isTorrent ? L.categoryOf("x.torrent") : L.categoryOf(name);
+    autoFolder();
     const card = $("card");
     card.textContent = "";
     const tile = document.createElement("div");
@@ -163,6 +177,7 @@
       });
       wrap.appendChild(b);
     });
+    autoFolder();
     const c = yt.choices[chosen];
     sizeBytes = c.size || 0;
     $("sizeLine").textContent = c.size
@@ -321,7 +336,13 @@
     });
     $("change").addEventListener("click", async () => {
       const r = await native({ type: "pick-folder", start: $("saveTo").value });
-      if (r.ok && r.path) $("saveTo").value = r.path;
+      if (r.ok && r.path) {
+        $("saveTo").value = r.path;
+        folderTouched = true;
+      }
+    });
+    $("saveTo").addEventListener("input", () => {
+      folderTouched = true;
     });
     $("saveAs").addEventListener("input", () => {
       if (!isYt) renderFileCard();
@@ -374,6 +395,8 @@
       return;
     }
     $("saveTo").value = info.defaultDir || "";
+    folders = info.organize && info.folders ? info.folders : null;
+    autoFolder();
     if (info.running > 0) {
       $("noteText").textContent = `${info.running} download${info.running === 1 ? " is" : "s are"} running. Choose Add to queue to start this one after ${info.running === 1 ? "it" : "them"}.`;
       $("note").hidden = false;

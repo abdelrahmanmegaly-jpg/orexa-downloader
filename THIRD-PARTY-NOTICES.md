@@ -31,6 +31,11 @@ time they are needed, and are checked against the published checksums when those
 [SIL Open Font License 1.1](https://openfontlicense.org). Included in `app/assets/`, `extension/fonts/`
 and `website/assets/fonts/`.
 
+[thmanyah sans](https://thmanyah.com), by thmanyah Publishing and Distribution, used for the Arabic
+interface. Its license allows embedding the font inside a compiled application but not sharing the
+font files, so the files are **not** in this repository: the official release build includes the font,
+and a build from source falls back to the Arabic fonts that come with Windows.
+
 ## Icons
 
 Interface icons are from [Lucide](https://lucide.dev) (ISC license).
