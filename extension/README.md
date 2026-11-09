@@ -2,16 +2,23 @@
 
 Sends downloads to Orexa Downloader.
 
-## Install (developer mode)
+## Install
 
-1. Install and open Orexa Downloader once (this registers the browser connector).
-2. In Chrome open `chrome://extensions` (Edge: `edge://extensions`).
-3. Turn on **Developer mode**.
-4. Choose **Load unpacked** and pick this `extension` folder. After installing Orexa it is in
-   `C:\Program Files\Orexa Downloader\extension` (Orexa > Settings > **Open folder** opens it).
+Get it from the official
+[Chrome Web Store](https://chromewebstore.google.com/detail/lhlfkhkcodflljkapdcpcecapmncjfeh)
+(Chrome, Brave and Edge). Orexa Downloader must be installed and opened once, which registers the
+browser connector. The installer also offers the extension to your browser, which then asks whether to
+turn it on.
 
-The extension has a fixed ID (`eohagpikpfaoeikeifebabmmchkceeaf`), which is the only one the
-connector accepts.
+### For developers (load the folder)
+
+1. Install and open Orexa Downloader once.
+2. In Chrome open `chrome://extensions` (Edge: `edge://extensions`) and turn on **Developer mode**.
+3. Choose **Load unpacked** and pick this `extension` folder (after installing Orexa it is in
+   `C:\Program Files\Orexa Downloader\extension`).
+
+The connector accepts two extension IDs: the store version (`lhlfkhkcodflljkapdcpcecapmncjfeh`) and the
+one loaded from this folder (`eohagpikpfaoeikeifebabmmchkceeaf`).
 
 ## What it does
 

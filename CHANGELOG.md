@@ -9,6 +9,8 @@ The browser extension is unchanged (still 0.1.6); this update is for the app and
 - The installer's last page tells you to expect that prompt.
 
 ### Improved
+- **The "How to add the extension" guide** now follows what the browser really shows, with screenshots: the Action required button (Chrome and Brave) or the three-dots menu (Edge), then Enable extension or Turn on extension, then pinning it. It also has a button that opens the extension's Chrome Web Store page.
+- Settings → Chrome extension now opens the Chrome Web Store.
 - Uninstalling removes the extension offer from your browsers.
 
 ### Fixed

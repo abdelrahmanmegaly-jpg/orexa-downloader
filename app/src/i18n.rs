@@ -270,6 +270,47 @@ fn ar_exact(s: &str) -> Option<&'static str> {
         "Hide details" => "إخفاء التفاصيل",
         "File size" => "حجم الملف",
         "Downloaded" => "تم تنزيل",
+        "Open the Chrome Web Store" => "افتح متجر Chrome الإلكتروني",
+        "Open the store page" => "افتح صفحة المتجر",
+        "Press the button above. The Orexa Downloader page opens in your browser." => "اضغط الزر أعلاه. تفتح صفحة Orexa Downloader في متصفحك.",
+        "Click Add to Chrome" => "انقر على إضافة إلى Chrome",
+        "Press the blue button on that page. In Brave it says Add to Brave." => "اضغط الزر الأزرق في تلك الصفحة. في Brave يظهر باسم إضافة إلى Brave.",
+        "Confirm" => "أكّد",
+        "Choose Add extension in the box that appears." => "اختر إضافة الإضافة في النافذة التي تظهر.",
+        "Orexa Downloader now appears in your extensions. Tip: pin it with the puzzle-piece icon. From now on, downloads, videos and magnet links open in Orexa." => {
+            "ظهر Orexa Downloader الآن في إضافاتك. نصيحة: ثبّته بأيقونة قطعة الأحجية. من الآن ستفتح التنزيلات والفيديوهات وروابط magnet في Orexa."
+        }
+        "Already installed Orexa? Your browser may be asking you to turn the extension on. Choose Enable." => {
+            "ثبّتّ Orexa بالفعل؟ قد يطلب منك متصفحك تفعيل الإضافة. اختر تفعيل."
+        }
+        "Using Edge? It may first ask to allow extensions from other stores. Choose Allow." => {
+            "تستخدم Edge؟ قد يطلب أولًا السماح بإضافات من متاجر أخرى. اختر السماح."
+        }
+        "Chrome / Brave" => "Chrome / Brave",
+        "Open your browser" => "افتح متصفحك",
+        "After you install Orexa, the browser shows a blue Action required button in the top-right corner." => {
+            "بعد تثبيت Orexa، يعرض المتصفح زرًا أزرق بعنوان Action required في الزاوية العلوية اليمنى."
+        }
+        "Click New extension added" => "انقر على New extension added",
+        "Click Action required, then New extension added (Orexa Downloader)." => "انقر على Action required ثم على New extension added (Orexa Downloader).",
+        "Choose Enable extension" => "اختر Enable extension",
+        "The browser asks about the extension. Choose Enable extension, not Remove from Chrome." => {
+            "يسألك المتصفح عن الإضافة. اختر Enable extension وليس Remove from Chrome."
+        }
+        "Pin it" => "ثبّتها",
+        "Click the puzzle-piece icon and pin Orexa Downloader so it is always in reach." => "انقر على أيقونة قطعة الأحجية وثبّت Orexa Downloader ليبقى في متناول يدك.",
+        "Chrome and Brave do not need these steps: the browser offers the extension by itself." => "Chrome وBrave لا يحتاجان هذه الخطوات: المتصفح يعرض الإضافة بنفسه.",
+        "Not seeing Action required? Open the Chrome Web Store with the button above and add the extension from there." => {
+            "لا ترى Action required؟ افتح متجر Chrome الإلكتروني بالزر أعلاه وأضف الإضافة من هناك."
+        }
+        "After you install Orexa, open Edge and click the three dots in the top-right corner." => "بعد تثبيت Orexa افتح Edge وانقر على النقاط الثلاث في الزاوية العلوية اليمنى.",
+        "Click Orexa Downloader extension has been added" => "انقر على Orexa Downloader extension has been added",
+        "It is at the top of the menu." => "تجدها في أعلى القائمة.",
+        "Choose Turn on extension" => "اختر Turn on extension",
+        "Edge asks about the extension. Choose Turn on extension, not Remove extension." => "يسألك Edge عن الإضافة. اختر Turn on extension وليس Remove extension.",
+        "Not seeing it? Open the Chrome Web Store with the button above. Edge may first ask to allow extensions from other stores. Choose Allow." => {
+            "لا تراها؟ افتح متجر Chrome الإلكتروني بالزر أعلاه. قد يطلب Edge أولًا السماح بإضافات من متاجر أخرى. اختر السماح."
+        }
         "Library" => "المكتبة",
         "Categories" => "الفئات",
         "Settings" => "الإعدادات",

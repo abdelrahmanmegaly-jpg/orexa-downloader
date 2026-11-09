@@ -2470,6 +2470,10 @@ impl App {
             Some("details") => app.details_wait = true,
             Some("details-dl") => app.details_id = app.downloads.iter().find(|d| !d.is_torrent() && d.status == Status::Downloading).map(|d| d.id),
             Some("help") => app.help_open = true,
+            Some("help-edge") => {
+                app.help_open = true;
+                app.help_browser = 1;
+            }
             Some("lang") => app.lang_menu = true,
             // Previews of the waiting states for a YouTube link (no network).
             Some("yt-checking") | Some("yt-idle") => {
@@ -3777,7 +3781,6 @@ impl App {
         let mut open_ext = false;
         let mut open_help = false;
         let mut pick_default_dir = false;
-        let ext_found = extension_dir().is_some();
         let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
         if let Some(y) = std::env::var("OREXA_SCROLL").ok().and_then(|v| v.parse::<f32>().ok()) {
             area = area.vertical_scroll_offset(y); // developer aid for screenshots
@@ -4014,14 +4017,10 @@ impl App {
                     line(
                         ui,
                         "Chrome extension",
-                        if ext_found {
-                            "Add it to Chrome, Brave or Edge."
-                        } else {
-                            "Extension folder not found next to the app."
-                        },
+                        "Add it to Chrome, Brave or Edge.",
                         true,
                         &mut |ui| {
-                            if button(ui, p, "Open folder", Some("folder"), Kind::Secondary, 36.0, ext_found).clicked() {
+                            if button(ui, p, "Open the Chrome Web Store", Some("open"), Kind::Secondary, 36.0, true).clicked() {
                                 open_ext = true;
                             }
                             if button(ui, p, "How to add", Some("help"), Kind::Secondary, 36.0, true).clicked() {
@@ -4097,9 +4096,7 @@ impl App {
             });
         });
         if open_ext {
-            if let Some(dir) = extension_dir() {
-                open_path(&dir);
-            }
+            open_store_page();
         }
         if open_help {
             self.help_open = true;
@@ -5534,13 +5531,25 @@ fn trunc_str(s: &str, max: usize) -> String {
     }
 }
 
-/// The tutorial pictures for "How to add the extension" (decoded once).
-const HELP_PICS: [&[u8]; 5] = [
-    include_bytes!("../assets/tutorial/step1_open.png"),
-    include_bytes!("../assets/tutorial/step2_developer.png"),
-    include_bytes!("../assets/tutorial/step3_load.png"),
-    include_bytes!("../assets/tutorial/step4_folder.png"),
-    include_bytes!("../assets/tutorial/step5_done.png"),
+/// The extension's page in the Chrome Web Store (Brave and Edge use it too).
+const STORE_URL: &str = "https://chromewebstore.google.com/detail/lhlfkhkcodflljkapdcpcecapmncjfeh";
+
+/// Open the store page in the default browser.
+fn open_store_page() {
+    let _ = Command::new("explorer").arg(STORE_URL).spawn();
+}
+
+/// The pictures of the guide: the browser's own "new extension added" screens
+/// (0-3 Chrome and Brave, 4-7 Edge).
+const HELP_PICS: [&[u8]; 8] = [
+    include_bytes!("../assets/tutorial/chrome1_action.png"),
+    include_bytes!("../assets/tutorial/chrome2_added.png"),
+    include_bytes!("../assets/tutorial/chrome3_enable.png"),
+    include_bytes!("../assets/tutorial/chrome4_pin.png"),
+    include_bytes!("../assets/tutorial/edge1_dots.png"),
+    include_bytes!("../assets/tutorial/edge2_added.png"),
+    include_bytes!("../assets/tutorial/edge3_turnon.png"),
+    include_bytes!("../assets/tutorial/edge4_pin.png"),
 ];
 
 /// A tutorial picture, resized to the exact pixels it is shown at (sharp on any screen scale).
@@ -5553,6 +5562,8 @@ fn help_picture(ctx: &egui::Context, index: usize, logical_width: f32) -> Option
             .collect()
     });
     let src = all.get(index)?;
+    // Never enlarge a picture past its own size.
+    let logical_width = logical_width.min(src.width() as f32);
     let px_w = ((logical_width * ctx.pixels_per_point()).round() as u32).clamp(16, 2400);
     let px_h = ((px_w as f32) * src.height() as f32 / src.width() as f32).round().max(1.0) as u32;
     let key = egui::Id::new(("help-pic", index, px_w));
@@ -5568,7 +5579,8 @@ fn help_picture(ctx: &egui::Context, index: usize, logical_width: f32) -> Option
 }
 
 impl App {
-    /// "How to add the Chrome extension": the folder, a button to open it, and picture steps.
+    /// "How to add the extension". Chrome and Brave: turn on what the installer offered (or add it
+    /// from the Chrome Web Store). Edge: load the extension folder by hand.
     fn ui_help_dialog(&mut self, ctx: &egui::Context, p: &Pal) {
         if !self.help_open {
             return;
@@ -5577,34 +5589,67 @@ impl App {
             self.help_open = false;
             return;
         }
-        let ext = extension_dir();
-        let browsers: [(&str, &str); 3] = [("Chrome", "chrome://extensions"), ("Brave", "brave://extensions"), ("Edge", "edge://extensions")];
-        let sel = self.help_browser.min(2);
-        let addr = browsers[sel].1;
+        let tabs = ["Chrome / Brave", "Edge"];
+        let sel = self.help_browser.min(1);
+        let edge = sel == 1;
         let mut close = false;
-        let mut open_folder = false;
-        let mut copy_addr = false;
+        let mut open_store = false;
         let mut pick = sel;
         let width = 700.0_f32.min(ctx.screen_rect().width() - 96.0).max(420.0);
         let scroll_h = (ctx.screen_rect().height() - 330.0).clamp(200.0, 560.0);
 
-        let steps: [(&str, String); 5] = [
-            ("Open the extensions page", format!("Type {} in the address bar and press Enter.", addr)),
-            ("Turn on Developer mode", "Use the switch in the top-right corner of the page.".to_string()),
-            ("Click Load unpacked", "A window for choosing a folder opens.".to_string()),
-            (
-                "Choose the extension folder",
-                "Select the folder named \"extension\" (the Open folder button above shows you where it is), then press Select Folder.".to_string(),
-            ),
-            (
-                "Done",
-                "Orexa Downloader now appears in your list. From now on, downloads, videos and magnet links open Orexa's window. Tip: pin it with the puzzle-piece icon.".to_string(),
-            ),
-        ];
+        // (title, text, picture) for each step.
+        let steps: Vec<(&str, String, usize)> = if edge {
+            vec![
+                (
+                    "Open your browser",
+                    "After you install Orexa, open Edge and click the three dots in the top-right corner.".to_string(),
+                    4,
+                ),
+                (
+                    "Click Orexa Downloader extension has been added",
+                    "It is at the top of the menu.".to_string(),
+                    5,
+                ),
+                (
+                    "Choose Turn on extension",
+                    "Edge asks about the extension. Choose Turn on extension, not Remove extension.".to_string(),
+                    6,
+                ),
+                (
+                    "Pin it",
+                    "Click the puzzle-piece icon and pin Orexa Downloader so it is always in reach.".to_string(),
+                    7,
+                ),
+            ]
+        } else {
+            vec![
+                (
+                    "Open your browser",
+                    "After you install Orexa, the browser shows a blue Action required button in the top-right corner.".to_string(),
+                    0,
+                ),
+                (
+                    "Click New extension added",
+                    "Click Action required, then New extension added (Orexa Downloader).".to_string(),
+                    1,
+                ),
+                (
+                    "Choose Enable extension",
+                    "The browser asks about the extension. Choose Enable extension, not Remove from Chrome.".to_string(),
+                    2,
+                ),
+                (
+                    "Pin it",
+                    "Click the puzzle-piece icon and pin Orexa Downloader so it is always in reach.".to_string(),
+                    3,
+                ),
+            ]
+        };
 
         let screen_h = ctx.screen_rect().height();
         modal(ctx, p, "help", width, 640.0, |ui| {
-            ui.set_max_height(screen_h); // the pictures list below needs room to grow
+            ui.set_max_height(screen_h);
             ui.spacing_mut().item_spacing.y = 0.0;
             hrow(ui, |ui| {
                 col(ui, |ui| {
@@ -5619,58 +5664,29 @@ impl App {
                     }
                 });
             });
-            ui.add_space(16.0);
-
-            // Where the extension is, with a button to open it.
-            egui::Frame::none()
-                .fill(p.bg)
-                .stroke(Stroke::new(1.0, p.border))
-                .rounding(12.0)
-                .inner_margin(Margin::symmetric(16.0, 12.0))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    hrow(ui, |ui| {
-                        col(ui, |ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            lbl(ui, "Extension folder", fs(13.0), p.sub);
-                            let path = ext
-                                .as_ref()
-                                .map(|d| d.display().to_string())
-                                .unwrap_or_else(|| "Not found next to the app".to_string());
-                            let g = trunc(ui, &path, f(13.0), p.muted, (width - 250.0).max(120.0));
-                            ui.label(g);
-                        });
-                        ui.with_layout(rl_layout(Align::Center), |ui| {
-                            if button(ui, p, "Open folder", Some("folder"), Kind::Primary, 38.0, ext.is_some()).clicked() {
-                                open_folder = true;
-                            }
-                        });
-                    });
-                });
             ui.add_space(14.0);
 
-            // Which browser, and the address to type.
+            // Which browser.
             hrow(ui, |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
-                for (i, (name, _)) in browsers.iter().enumerate() {
+                for (i, name) in tabs.iter().enumerate() {
                     let kind = if i == sel { Kind::Primary } else { Kind::Secondary };
                     if button(ui, p, name, None, kind, 36.0, true).clicked() {
                         pick = i;
                     }
                 }
                 ui.with_layout(rl_layout(Align::Center), |ui| {
-                    if button(ui, p, "Copy address", None, Kind::Secondary, 36.0, true).clicked() {
-                        copy_addr = true;
+                    if button(ui, p, "Open the Chrome Web Store", Some("open"), Kind::Secondary, 36.0, true).clicked() {
+                        open_store = true;
                     }
-                    lbl(ui, addr, fs(14.0), p.text);
                 });
             });
             ui.add_space(12.0);
 
             egui::ScrollArea::vertical().max_height(scroll_h).auto_shrink([false, true]).show(ui, |ui| {
                 let img_w = ui.available_width() - 14.0;
-                for (i, (title, body)) in steps.iter().enumerate() {
-                    ui.horizontal_top(|ui| {
+                for (i, (title, body, pic)) in steps.iter().enumerate() {
+                    hrow(ui, |ui| {
                         let (c, _) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::hover());
                         ui.painter().circle_filled(c.center(), 14.0, p.accent);
                         ui.painter().txt(c.center(), Align2::CENTER_CENTER, (i + 1).to_string(), fs(14.0), p.accent_ink);
@@ -5682,28 +5698,30 @@ impl App {
                         });
                     });
                     ui.add_space(8.0);
-                    if let Some((tex, size)) = help_picture(ui.ctx(), i, img_w) {
+                    if let Some((tex, size)) = help_picture(ui.ctx(), *pic, img_w) {
                         let (r, _) = ui.allocate_exact_size(size, Sense::hover());
                         ui.painter().image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
                         ui.painter().rect_stroke(r, 8.0, Stroke::new(1.0, p.border_strong));
                     }
                     ui.add_space(20.0);
                 }
-                lbl(ui, "Using Brave or Edge? The steps are the same; only the address at the start differs.", f(12.0), p.muted);
+                lbl(
+                    ui,
+                    if edge {
+                        "Not seeing it? Open the Chrome Web Store with the button above. Edge may first ask to allow extensions from other stores. Choose Allow."
+                    } else {
+                        "Not seeing Action required? Open the Chrome Web Store with the button above and add the extension from there."
+                    },
+                    f(12.0),
+                    p.muted,
+                );
                 ui.add_space(4.0);
             });
         });
 
         self.help_browser = pick;
-        if copy_addr {
-            if let Ok(mut cb) = arboard::Clipboard::new() {
-                let _ = cb.set_text(addr.to_string());
-            }
-        }
-        if open_folder {
-            if let Some(d) = &ext {
-                open_path(d);
-            }
+        if open_store {
+            open_store_page();
         }
         if close {
             self.help_open = false;

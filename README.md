@@ -59,8 +59,10 @@ video, or open a magnet link, Orexa takes it over, downloads it faster, and keep
    and run it. Anyone can download it; no account is needed. It installs to Program Files and can add a
    desktop shortcut. Running a newer setup on a PC that already has Orexa updates it in place, keeping
    your downloads and settings.
-2. **Add the browser extension.** Click **How to add the extension?** in the app's title bar for a short
-   illustrated guide, or see [`extension/README.md`](extension/README.md).
+2. **Add the browser extension** from the official
+   [Chrome Web Store](https://chromewebstore.google.com/detail/lhlfkhkcodflljkapdcpcecapmncjfeh)
+   (it works in Chrome, Brave and Edge). After installing Orexa, your browser may already ask whether to
+   turn it on: choose **Enable**. Otherwise click **How to add the extension?** in the app's title bar.
 
 Requirements: Windows 10 or 11 (64-bit) and about 40 MB of disk space. The first video download also
 needs an internet connection to fetch the video tools.
