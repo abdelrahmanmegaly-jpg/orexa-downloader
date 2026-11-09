@@ -495,17 +495,22 @@ fn ar_exact(s: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+pub static LANG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn english_stays_english() {
+        let _g = LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set(Lang::En);
         assert_eq!(translate("Settings"), None);
     }
 
     #[test]
     fn templates_fill_in_values() {
+        let _g = LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set(Lang::Ar);
         assert_eq!(translate("3 files").as_deref(), Some("3 ملفات"));
         assert_eq!(translate("2 min 5 s").as_deref(), Some("2 د 5 ث"));
@@ -517,6 +522,7 @@ mod tests {
 
     #[test]
     fn unknown_text_is_left_alone() {
+        let _g = LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set(Lang::Ar);
         assert_eq!(translate("movie.mp4"), None);
         set(Lang::En);

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.7
+
+The browser extension is unchanged (still 0.1.6); this update is for the app and installer.
+
+### Added
+- **Chrome Web Store extension support.** The app now works with the extension installed from the Chrome Web Store, and the installer offers it to Chrome, Brave and Edge: the next time you open the browser it asks whether to turn the extension on.
+- The installer's last page tells you to expect that prompt.
+
+### Improved
+- Uninstalling removes the extension offer from your browsers.
+
+### Fixed
+- Nothing in this release.
+
+### Removed
+- Nothing in this release.
+
 ## 0.1.6
 
 ### Added

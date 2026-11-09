@@ -310,6 +310,29 @@ fn install(opts: &InstallOpts, report: &dyn Fn(f32, &str)) -> Result<(), String>
         dir = q(dir)
     ));
 
+    // Offer the browser extension: Chrome, Brave and Edge ask the person, the next time they
+    // start, whether to turn it on.
+    report(0.85, "Offering the browser extension...");
+    for root in [
+        r"HKCU\Software\Google\Chrome\Extensions",
+        r"HKCU\Software\BraveSoftware\Brave-Browser\Extensions",
+        r"HKCU\Software\Microsoft\Edge\Extensions",
+    ] {
+        let _ = hidden("reg")
+            .args([
+                "add",
+                &format!(r"{}\lhlfkhkcodflljkapdcpcecapmncjfeh", root),
+                "/v",
+                "update_url",
+                "/t",
+                "REG_SZ",
+                "/d",
+                "https://clients2.google.com/service/update2/crx",
+                "/f",
+            ])
+            .status();
+    }
+
     report(0.9, "Registering with Windows...");
     let uninstall_cmd = format!("\"{}\" --uninstall", dir.join("uninstall.exe").display());
     let icon = format!("{},0", exe.display());
@@ -401,8 +424,19 @@ fn uninstall(dir: &Path, purge: bool, test: bool) {
         ] {
             let _ = hidden("reg").args(["delete", key, "/f"]).status();
         }
+        // The offer to add the store extension to Chrome, Brave and Edge.
+        for root in [
+            r"HKCU\Software\Google\Chrome\Extensions",
+            r"HKCU\Software\BraveSoftware\Brave-Browser\Extensions",
+            r"HKCU\Software\Microsoft\Edge\Extensions",
+        ] {
+            let _ = hidden("reg")
+                .args(["delete", &format!(r"{}\lhlfkhkcodflljkapdcpcecapmncjfeh", root), "/f"])
+                .status();
+        }
         if let Some(local) = env_path("LOCALAPPDATA") {
             let orexa = local.join("Orexa");
+            let _ = fs::remove_file(orexa.join("extension-offered"));
             // The helper tools are always removed; history and settings only on request.
             let _ = fs::remove_dir_all(orexa.join("tools"));
             // The saved YouTube sign-in is private, so it never outlives the app.
@@ -761,6 +795,16 @@ impl Wizard {
                 self.header(ui, "All set", &format!("Orexa Downloader {} is installed", VERSION));
                 ui.add_space(24.0);
                 ui.label(rt("You can open it from the Start menu or the Desktop.", 14.0, "reg", SUB));
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Label::new(rt(
+                        "Chrome, Brave or Edge will ask you to turn on the Orexa extension the next time you open them.",
+                        13.0,
+                        "reg",
+                        MUTED,
+                    ))
+                    .wrap(),
+                );
                 ui.add_space(8.0);
                 ui.checkbox(&mut self.launch, rt("Open Orexa Downloader now", 14.0, "reg", NAVY));
                 ui.with_layout(Layout::bottom_up(Align::Max), |ui| {

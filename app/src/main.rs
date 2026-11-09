@@ -2403,6 +2403,7 @@ impl App {
             app._tray = shell::make_tray();
             shell::register_notifications();
             shell::register_native_host();
+            shell::offer_extension_to_browsers();
             youtube::clean_stale_cookie_copies();
         }
         if app.persist {
@@ -6167,6 +6168,7 @@ mod polish_tests {
 
     #[test]
     fn new_texts_translate() {
+        let _g = i18n::LANG_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         i18n::set(i18n::Lang::Ar);
         assert_eq!(i18n::translate("3 selected").as_deref(), Some("3 محدد"));
         assert_eq!(i18n::translate("Remove 4 downloads?").as_deref(), Some("إزالة 4 تنزيلات؟"));

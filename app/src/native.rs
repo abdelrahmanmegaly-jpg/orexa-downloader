@@ -5,10 +5,11 @@
 use super::*;
 use serde_json::{json, Value};
 
-/// The extension allowed to talk to this connector.
-/// The extensions allowed to talk to this connector. Add the Chrome Web Store ID here once the
-/// extension is published (the store gives it its own ID), then ship a new installer.
+/// The Chrome Web Store version of the extension.
+pub const STORE_EXTENSION_ID: &str = "lhlfkhkcodflljkapdcpcecapmncjfeh";
+/// The extensions allowed to talk to this connector.
 pub const EXTENSION_IDS: &[&str] = &[
+    STORE_EXTENSION_ID,
     "eohagpikpfaoeikeifebabmmchkceeaf", // the one loaded from the extension folder
 ];
 pub const HOST_NAME: &str = "com.orexa.downloader";

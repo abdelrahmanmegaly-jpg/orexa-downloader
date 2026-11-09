@@ -517,6 +517,47 @@ pub fn register_native_host() {
     });
 }
 
+/// Where Chrome, Brave and Edge look for extensions that a program adds through the registry.
+const EXTERNAL_EXTENSION_ROOTS: &[&str] = &[
+    r"HKCU\Software\Google\Chrome\Extensions",
+    r"HKCU\Software\BraveSoftware\Brave-Browser\Extensions",
+    r"HKCU\Software\Microsoft\Edge\Extensions",
+];
+/// The Chrome Web Store update address (it is what makes the browser fetch the store version).
+const STORE_UPDATE_URL: &str = "https://clients2.google.com/service/update2/crx";
+
+/// The registry keys that offer the store extension to each browser.
+pub fn external_extension_keys() -> Vec<String> {
+    EXTERNAL_EXTENSION_ROOTS
+        .iter()
+        .map(|root| format!(r"{}\{}", root, native::STORE_EXTENSION_ID))
+        .collect()
+}
+
+/// Offer the store extension to the installed browsers, once. Chrome, Brave and Edge then ask
+/// the person, the next time they start, whether to turn it on; saying no is remembered by the
+/// browser. Development builds never do this.
+pub fn offer_extension_to_browsers() {
+    if std::env::var_os("OREXA_NO_AUTOSTART").is_some() || std::env::var_os("OREXA_NO_REGISTRY").is_some() {
+        return;
+    }
+    thread::spawn(|| {
+        let Ok(exe) = std::env::current_exe() else { return };
+        if exe.to_string_lossy().to_lowercase().contains("\\target\\") {
+            return;
+        }
+        let marker = state::data_dir().join("extension-offered");
+        if marker.exists() {
+            return;
+        }
+        let _ = fs::create_dir_all(state::data_dir());
+        for key in external_extension_keys() {
+            reg(&["add", &key, "/v", "update_url", "/t", "REG_SZ", "/d", STORE_UPDATE_URL, "/f"]);
+        }
+        let _ = fs::write(marker, "1");
+    });
+}
+
 /// True when Windows itself is set to Arabic (used to pick the language on first run).
 pub fn system_language_is_arabic() -> bool {
     #[link(name = "kernel32")]
@@ -540,4 +581,27 @@ pub fn screen_size() -> Option<(f32, f32)> {
     }
     let (w, h) = unsafe { (GetSystemMetrics(0), GetSystemMetrics(1)) };
     (w > 0 && h > 0).then(|| (w as f32, h as f32))
+}
+
+#[cfg(test)]
+mod extension_offer_tests {
+    use super::*;
+
+    #[test]
+    fn the_store_extension_is_offered_to_chrome_brave_and_edge() {
+        let keys = external_extension_keys();
+        assert_eq!(keys.len(), 3);
+        for k in &keys {
+            assert!(k.ends_with(native::STORE_EXTENSION_ID), "{k}");
+        }
+        assert!(keys.iter().any(|k| k.contains(r"Google\Chrome\Extensions")));
+        assert!(keys.iter().any(|k| k.contains(r"BraveSoftware\Brave-Browser\Extensions")));
+        assert!(keys.iter().any(|k| k.contains(r"Microsoft\Edge\Extensions")));
+    }
+
+    #[test]
+    fn the_connector_trusts_the_store_extension_and_the_folder_one() {
+        assert!(native::EXTENSION_IDS.contains(&"lhlfkhkcodflljkapdcpcecapmncjfeh"));
+        assert!(native::EXTENSION_IDS.contains(&"eohagpikpfaoeikeifebabmmchkceeaf"));
+    }
 }

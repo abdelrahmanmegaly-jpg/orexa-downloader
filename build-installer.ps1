@@ -2,23 +2,24 @@
 #   powershell -ExecutionPolicy Bypass -File .\build-installer.ps1
 # Result: dist\Orexa-Downloader-Setup.exe
 #
-# To release an update: raise "version" in extension\manifest.json (the one place the version
-# lives; the app and the installer always follow the extension), run this script, and send
-# the new Orexa-Downloader-Setup.exe. Running it on a PC that already has Orexa
-# Downloader updates it in place (old files replaced; downloads and settings kept).
+# To release an update: raise "version" in app\Cargo.toml (the one place the app version
+# lives; the installer follows it), run this script, and send the new
+# Orexa-Downloader-Setup.exe. The browser extension has its own version (extension\manifest.json)
+# and only changes when the extension itself changes. Running this on a PC that already has
+# Orexa Downloader updates it in place (old files replaced; downloads and settings kept).
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 
-# The app and installer take the extension's version.
-$manifest = Get-Content -Raw -Encoding UTF8 (Join-Path $root 'extension\manifest.json') | ConvertFrom-Json
-$version = $manifest.version
-foreach ($toml in @('app\Cargo.toml', 'setup\Cargo.toml')) {
-    $path = Join-Path $root $toml
-    $text = [System.IO.File]::ReadAllText($path)
-    $updated = [regex]::Replace($text, '(?m)^version = "[^"]*"', "version = `"$version`"", 1)
-    if ($updated -ne $text) { [System.IO.File]::WriteAllText($path, $updated) }
-}
-Write-Host "Version $version (from the extension)"
+# The installer takes the app's version.
+$appToml = [System.IO.File]::ReadAllText((Join-Path $root 'app\Cargo.toml'))
+$m = [regex]::Match($appToml, '(?m)^version = "([^"]*)"')
+if (-not $m.Success) { throw 'Could not read the app version from app\Cargo.toml' }
+$version = $m.Groups[1].Value
+$path = Join-Path $root 'setup\Cargo.toml'
+$text = [System.IO.File]::ReadAllText($path)
+$updated = [regex]::Replace($text, '(?m)^version = "[^"]*"', "version = `"$version`"", 1)
+if ($updated -ne $text) { [System.IO.File]::WriteAllText($path, $updated) }
+Write-Host "Version $version (from app\Cargo.toml)"
 
 Push-Location (Join-Path $root 'app')
 cargo build --release
