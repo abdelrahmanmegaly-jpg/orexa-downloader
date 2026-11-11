@@ -161,6 +161,10 @@ fn fill_template(s: &str, en: &str, tr: &str, table: &[(&str, &str)], depth: u8)
 }
 
 const AR_TEMPLATES: &[(&str, &str)] = &[
+    ("Version {} is ready. You have {}.", "الإصدار {1} جاهز. لديك {2}."),
+    ("Orexa Downloader {} is the newest version.", "Orexa Downloader {1} هو أحدث إصدار."),
+    ("Downloading the update: {} of {}", "جارٍ تنزيل التحديث: {1} من {2}"),
+    ("GitHub answered {}", "ردّ GitHub برمز {1}"),
     ("{} selected", "{1} محدد"),
     ("Remove {} downloads?", "إزالة {1} تنزيلات؟"),
     ("Going to sleep in {} s", "سيدخل الجهاز وضع السكون بعد {1} ث"),
@@ -311,6 +315,23 @@ fn ar_exact(s: &str) -> Option<&'static str> {
         "Not seeing it? Open the Chrome Web Store with the button above. Edge may first ask to allow extensions from other stores. Choose Allow." => {
             "لا تراها؟ افتح متجر Chrome الإلكتروني بالزر أعلاه. قد يطلب Edge أولًا السماح بإضافات من متاجر أخرى. اختر السماح."
         }
+        "Version" => "الإصدار",
+        "Update available" => "تحديث متاح",
+        "Update" => "تحديث",
+        "Up to date" => "محدّث",
+        "You are up to date" => "أنت على أحدث إصدار",
+        "Checking for updates" => "جارٍ البحث عن تحديثات",
+        "Could not check for updates" => "تعذّر البحث عن تحديثات",
+        "One moment..." => "لحظة...",
+        "What is new" => "ما الجديد",
+        "Update now" => "حدّث الآن",
+        "Later" => "لاحقًا",
+        "Check again" => "تحقق مجددًا",
+        "Open the download page" => "افتح صفحة التنزيل",
+        "Downloading the update..." => "جارٍ تنزيل التحديث...",
+        "Starting the update. Orexa will close and open again." => "جارٍ بدء التحديث. سيُغلق Orexa ثم يُفتح مرة أخرى.",
+        "Could not reach GitHub" => "تعذّر الوصول إلى GitHub",
+        "The downloaded file did not match its checksum, so it was not run" => "لم يطابق الملف المنزَّل رمز التحقق الخاص به، لذلك لم يُشغَّل",
         "Library" => "المكتبة",
         "Categories" => "الفئات",
         "Settings" => "الإعدادات",

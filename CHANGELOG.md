@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.8
+
+The browser extension is unchanged (still 0.1.6); this update is for the app and installer.
+
+### Added
+- **Updates inside the app.** The version number now shows at the bottom of the sidebar, under Settings, with **Up to date** or a blue **Update** badge. Click it to see what is new in the latest release and press **Update now**: Orexa downloads the installer from GitHub, checks it, and updates itself.
+
+### Improved
+- After a download finishes, the download window now **closes itself** when you click **Open file** or **Show in folder**.
+- When a download finishes, its window **comes to the front** even if you are working in another app.
+
+### Fixed
+- Nothing in this release.
+
+### Removed
+- Nothing in this release.
+
 ## 0.1.7
 
 The browser extension is unchanged (still 0.1.6); this update is for the app and installer.

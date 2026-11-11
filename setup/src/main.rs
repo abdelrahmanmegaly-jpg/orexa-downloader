@@ -6,7 +6,7 @@
 //   settings are kept.
 // - The installed copy of this file is the uninstaller (--uninstall).
 //
-// Scripted use:  Orexa-Downloader-Setup.exe --silent [--dir "D:\Apps\Orexa"] [--no-desktop]
+// Scripted use:  Orexa-Downloader-Setup.exe --silent [--dir "D:\Apps\Orexa"] [--no-desktop] [--launch]
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::fs;
@@ -923,9 +923,18 @@ fn main() {
             .or_else(|| find_existing().map(|e| e.dir))
             .unwrap_or_else(default_dir);
         let opts = InstallOpts { dir, desktop: !flag("--no-desktop"), test };
+        // --launch: open Orexa again when done (used by the in-app updater), even if the
+        // install failed, so the person is never left without the app.
+        let app = opts.dir.join("orexa-downloader.exe");
         if let Err(e) = install(&opts, &|_, _| {}) {
             let _ = fs::write(std::env::temp_dir().join("orexa-install-error.txt"), e);
+            if flag("--launch") && !test {
+                launch_normally(&app);
+            }
             std::process::exit(1);
+        }
+        if flag("--launch") && !test {
+            launch_normally(&app);
         }
         return;
     }

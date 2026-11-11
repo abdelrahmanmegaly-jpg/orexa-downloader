@@ -7,6 +7,7 @@ mod native;
 mod shell;
 mod state;
 mod torrent;
+mod update;
 mod youtube;
 
 use std::collections::{BTreeMap, HashMap};
@@ -184,6 +185,12 @@ impl Download {
     fn is_torrent(&self) -> bool {
         matches!(self.source, Source::Torrent)
     }
+}
+
+/// Answers from the update threads.
+enum UpdateMsg {
+    Checked(Result<Option<update::Release>, String>),
+    Downloaded(Result<PathBuf, String>),
 }
 
 /// What to do when every download has finished.
@@ -2266,6 +2273,23 @@ struct App {
     details_expanded: bool,
     /// Bring the pop-up back to the front (it was minimized, or a new download started).
     floating_front: bool,
+    /// The newest release on GitHub, and what the update window is doing.
+    update: update::UpdateState,
+    update_rx: Receiver<UpdateMsg>,
+    update_tx: Sender<UpdateMsg>,
+    update_open: bool,
+    /// When the next check for a new release is due.
+    update_due: Option<Instant>,
+    /// Bytes of the installer downloaded so far, while it downloads.
+    update_done: Arc<std::sync::atomic::AtomicU64>,
+    update_downloading: bool,
+    /// What went wrong while updating, shown in the window.
+    update_error: Option<String>,
+    /// The installer is on its way: the app closes for it.
+    update_launched: bool,
+    update_closing: Option<Instant>,
+    /// Keep the pop-up above other windows until then (so a finished download is seen).
+    floating_top_until: Option<Instant>,
     after_finish: AfterFinish,
     /// Finished something since the queue was last idle (so "after finishing" can fire).
     batch_done: bool,
@@ -2323,6 +2347,7 @@ impl App {
         let (engine, ev_rx) = Engine::new();
         let (probe_tx, probe_rx) = channel::<ProbeResult>();
         let (setup_tx, setup_rx) = channel::<SetupEvent>();
+        let (update_tx, update_rx) = channel::<UpdateMsg>();
         let (thumb_tx, thumb_rx) = channel::<(u64, Thumb)>();
         let mut app = Self {
             downloads: if o.demo { demo_with_details(sample_downloads()) } else { Vec::new() },
@@ -2380,6 +2405,17 @@ impl App {
             floating: None,
             details_expanded: false,
             floating_front: false,
+            floating_top_until: None,
+            update: update::UpdateState::Idle,
+            update_rx,
+            update_tx,
+            update_open: false,
+            update_due: None,
+            update_done: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            update_downloading: false,
+            update_error: None,
+            update_launched: false,
+            update_closing: None,
             after_finish: AfterFinish::Nothing,
             batch_done: false,
             last_done_dir: None,
@@ -2405,6 +2441,9 @@ impl App {
             shell::register_native_host();
             shell::offer_extension_to_browsers();
             youtube::clean_stale_cookie_copies();
+        }
+        if (app.persist && app.screenshot_path.is_none()) || std::env::var_os("OREXA_UPDATE_API").is_some() {
+            app.update_due = Some(Instant::now() + Duration::from_secs(6));
         }
         if app.persist {
             let first_run = !state::exists();
@@ -2475,6 +2514,7 @@ impl App {
                 app.help_browser = 1;
             }
             Some("lang") => app.lang_menu = true,
+            Some("update") => app.update_open = true,
             // Previews of the waiting states for a YouTube link (no network).
             Some("yt-checking") | Some("yt-idle") => {
                 app.open_add();
@@ -3189,6 +3229,12 @@ impl App {
                         if status == Status::Complete && before != Status::Complete {
                             self.batch_done = true;
                             self.last_done_dir = Some(d.path());
+                            // The finished download shows up in front of whatever is on screen.
+                            if self.persist && !self.demo {
+                                self.floating = Some(d.id);
+                                self.floating_front = true;
+                                self.floating_top_until = Some(Instant::now() + Duration::from_secs(4));
+                            }
                         }
                         if status == Status::Complete && self.notify_done && self.persist {
                             shell::toast_file("Download complete".into(), d.file_name.clone(), d.path());
@@ -3464,6 +3510,13 @@ impl App {
                     }
                 }
                 ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
+                    // The version, and whether there is a newer one (bottom of the sidebar).
+                    if self.version_row(ui, p).clicked() {
+                        self.update_open = true;
+                        if matches!(self.update, update::UpdateState::Idle | update::UpdateState::Failed(_)) {
+                            self.start_update_check();
+                        }
+                    }
                     if nav_item(ui, p, "settings", "Settings", None, self.page == Page::Settings) {
                         self.page = Page::Settings;
                     }
@@ -4887,6 +4940,287 @@ fn download_details_body(ui: &mut Ui, p: &Pal, d: &Download, screen_h: f32, expa
 }
 
 impl App {
+    /// "Version 0.1.7 · Up to date" / "Update available", under Settings in the sidebar.
+    fn version_row(&self, ui: &mut Ui, p: &Pal) -> Response {
+        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
+        if resp.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            ui.painter().rect_filled(rect, 8.0, p.tile);
+        }
+        let ver = format!("{} {}", i18n::translate("Version").unwrap_or_else(|| "Version".to_string()), env!("CARGO_PKG_VERSION"));
+        let cy = rect.center().y;
+        ui.painter().text(
+            pos2(mx(rect, rect.left() + 12.0), cy),
+            malign(Align2::LEFT_CENTER),
+            if rtl() { shape_rtl(&ver) } else { ver },
+            f(12.0),
+            p.muted,
+        );
+        let (label, color, dot) = match &self.update {
+            update::UpdateState::Available(r) => (format!("{} {}", tr("Update"), r.version), p.accent_ink, Some(p.accent)),
+            update::UpdateState::UpToDate => (tr("Up to date"), p.ok, None),
+            update::UpdateState::Checking => (tr("Checking..."), p.muted, None),
+            _ => (String::new(), p.muted, None),
+        };
+        if !label.is_empty() {
+            let w = text_w_raw(ui, &label, fs(11.5));
+            let pill_w = w + 20.0;
+            let pill = Rect::from_min_size(pos2(rect.right() - 8.0 - pill_w, cy - 11.0), vec2(pill_w, 22.0));
+            let pill = mrect(rect, pill);
+            if let Some(d) = dot {
+                ui.painter().rect_filled(pill, 11.0, p.accent_soft);
+                ui.painter().circle_filled(pos2(if rtl() { pill.right() - 9.0 } else { pill.left() + 9.0 }, cy), 3.5, d);
+            }
+            let tx = if dot.is_some() { 6.0 } else { 0.0 };
+            ui.painter().text(
+                pos2(pill.center().x + if rtl() { -tx / 2.0 } else { tx / 2.0 }, cy),
+                Align2::CENTER_CENTER,
+                label,
+                fs(11.5),
+                color,
+            );
+        }
+        resp
+    }
+
+    fn start_update_check(&mut self) {
+        if matches!(self.update, update::UpdateState::Checking) {
+            return;
+        }
+        self.update = update::UpdateState::Checking;
+        self.update_error = None;
+        let tx = self.update_tx.clone();
+        thread::spawn(move || {
+            let _ = tx.send(UpdateMsg::Checked(update::check(env!("CARGO_PKG_VERSION"))));
+        });
+        // Look again in six hours.
+        self.update_due = Some(Instant::now() + Duration::from_secs(6 * 3600));
+    }
+
+    fn start_update_download(&mut self) {
+        let update::UpdateState::Available(rel) = self.update.clone() else { return };
+        self.update_error = None;
+        self.update_downloading = true;
+        self.update_done.store(0, std::sync::atomic::Ordering::Relaxed);
+        let (tx, done) = (self.update_tx.clone(), self.update_done.clone());
+        thread::spawn(move || {
+            let _ = tx.send(UpdateMsg::Downloaded(update::download(&rel, &done)));
+        });
+    }
+
+    fn poll_update(&mut self) {
+        if let Some(at) = self.update_due {
+            if Instant::now() >= at {
+                self.update_due = None;
+                self.start_update_check();
+            }
+        }
+        while let Ok(msg) = self.update_rx.try_recv() {
+            match msg {
+                UpdateMsg::Checked(Ok(Some(rel))) => self.update = update::UpdateState::Available(rel),
+                UpdateMsg::Checked(Ok(None)) => self.update = update::UpdateState::UpToDate,
+                UpdateMsg::Checked(Err(e)) => self.update = update::UpdateState::Failed(e),
+                UpdateMsg::Downloaded(Err(e)) => {
+                    self.update_downloading = false;
+                    self.update_error = Some(e);
+                }
+                UpdateMsg::Downloaded(Ok(path)) => {
+                    // Run the installer on its own (it updates the app in place and opens it
+                    // again), then let this copy close so its files can be replaced.
+                    let started = Command::new(&path).args(["--silent", "--launch"]).spawn();
+                    match started {
+                        Ok(_) => {
+                            self.update_launched = true;
+                            self.update_downloading = false;
+                        }
+                        Err(e) => {
+                            self.update_downloading = false;
+                            self.update_error = Some(format!("The installer could not start: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+        if self.update_launched && !self.demo {
+            // Give the installer a moment to take over, then close.
+            if self.update_closing.get_or_insert_with(Instant::now).elapsed() > Duration::from_millis(1500) {
+                shell::request_quit();
+            }
+        }
+    }
+
+    /// The update window: what is new, and Update now.
+    fn ui_update_dialog(&mut self, ctx: &egui::Context, p: &Pal) {
+        if !self.update_open {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !self.update_downloading && !self.update_launched {
+            self.update_open = false;
+            return;
+        }
+        if self.update_downloading || self.update_launched {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+        let state = self.update.clone();
+        let current = env!("CARGO_PKG_VERSION");
+        let busy = self.update_downloading || self.update_launched;
+        let (done_bytes, total) = match &state {
+            update::UpdateState::Available(r) => (self.update_done.load(std::sync::atomic::Ordering::Relaxed), r.size),
+            _ => (0, 0),
+        };
+        let error = self.update_error.clone();
+        let mut close = false;
+        let mut update_now = false;
+        let mut check_again = false;
+        let mut open_page: Option<String> = None;
+        let screen_h = ctx.screen_rect().height();
+
+        modal(ctx, p, "update", 520.0, 480.0, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            hrow(ui, |ui| {
+                col(ui, |ui| {
+                    let title = match &state {
+                        update::UpdateState::Available(_) => "Update available",
+                        update::UpdateState::UpToDate => "You are up to date",
+                        update::UpdateState::Checking | update::UpdateState::Idle => "Checking for updates",
+                        update::UpdateState::Failed(_) => "Could not check for updates",
+                    };
+                    lbl(ui, title, fb(22.0), p.text);
+                    ui.add_space(4.0);
+                    match &state {
+                        update::UpdateState::Available(r) => {
+                            lbl(ui, format!("Version {} is ready. You have {}.", r.version, current), f(14.0), p.muted);
+                        }
+                        update::UpdateState::UpToDate => {
+                            lbl(ui, format!("Orexa Downloader {} is the newest version.", current), f(14.0), p.muted);
+                        }
+                        update::UpdateState::Failed(e) => {
+                            lbl(ui, e.clone(), f(14.0), p.bad);
+                        }
+                        _ => {
+                            lbl(ui, "One moment...", f(14.0), p.muted);
+                        }
+                    }
+                });
+                if !busy {
+                    ui.with_layout(rl_layout(Align::Min), |ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(36.0, 36.0), Sense::hover());
+                        if icon_button_at(ui, p, r, "x", egui::Id::new("update_close"), "Close") {
+                            close = true;
+                        }
+                    });
+                }
+            });
+
+            if let update::UpdateState::Available(rel) = &state {
+                ui.add_space(16.0);
+                lbl(ui, "What is new", fs(14.0), p.text);
+                ui.add_space(8.0);
+                egui::Frame::none()
+                    .fill(p.bg)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .rounding(12.0)
+                    .inner_margin(Margin::symmetric(16.0, 12.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .id_salt("update_notes")
+                            .max_height((screen_h - 420.0).clamp(120.0, 300.0))
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                for line in update::plain_notes(&rel.notes) {
+                                    match line {
+                                        update::NoteLine::Heading(h) => {
+                                            ui.add_space(4.0);
+                                            lbl(ui, h, fs(13.5), p.text);
+                                        }
+                                        update::NoteLine::Bullet(b, level) => {
+                                            let dot = if rtl() { format!("{} \u{2022}", b) } else { format!("\u{2022} {}", b) };
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.add_space(12.0 * level as f32);
+                                                lbl(ui, dot, f(13.0), p.sub);
+                                            });
+                                        }
+                                        update::NoteLine::Text(t) => {
+                                            lbl(ui, t, f(13.0), p.sub);
+                                        }
+                                    }
+                                }
+                            });
+                    });
+                ui.add_space(16.0);
+
+                if busy {
+                    // Download progress, then the hand-over to the installer.
+                    let frac = if total > 0 { (done_bytes as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                    let note = if self.update_launched {
+                        "Starting the update. Orexa will close and open again.".to_string()
+                    } else if total > 0 {
+                        format!("Downloading the update: {} of {}", fmt_size(done_bytes), fmt_size(total))
+                    } else {
+                        "Downloading the update...".to_string()
+                    };
+                    lbl(ui, note, f(13.0), p.sub);
+                    ui.add_space(8.0);
+                    let (track, _) = ui.allocate_exact_size(vec2(ui.available_width(), 10.0), Sense::hover());
+                    ui.painter().rect_filled(track, 5.0, p.track);
+                    let w = if self.update_launched { track.width() } else { (track.width() * frac).max(10.0) };
+                    ui.painter().rect_filled(mrect(track, Rect::from_min_size(track.min, vec2(w, 10.0))), 5.0, p.progress);
+                } else {
+                    if let Some(e) = &error {
+                        lbl(ui, e.clone(), f(13.0), p.bad);
+                        ui.add_space(8.0);
+                    }
+                    let fw = ui.available_width();
+                    let start = if rtl() { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
+                    ui.allocate_ui_with_layout(vec2(fw, 44.0), start, |ui| {
+                        if button(ui, p, "Update now", Some("download"), Kind::Primary, 44.0, true).clicked() {
+                            update_now = true;
+                        }
+                        ui.add_space(4.0);
+                        if button(ui, p, "Later", None, Kind::Secondary, 44.0, true).clicked() {
+                            close = true;
+                        }
+                        if error.is_some() && !rel.page.is_empty() {
+                            ui.with_layout(rl_layout(Align::Center), |ui| {
+                                if button(ui, p, "Open the download page", None, Kind::Secondary, 44.0, true).clicked() {
+                                    open_page = Some(rel.page.clone());
+                                }
+                            });
+                        }
+                    });
+                }
+            } else if !matches!(state, update::UpdateState::Checking | update::UpdateState::Idle) {
+                ui.add_space(20.0);
+                let fw = ui.available_width();
+                let start = if rtl() { Layout::right_to_left(Align::Center) } else { Layout::left_to_right(Align::Center) };
+                ui.allocate_ui_with_layout(vec2(fw, 44.0), start, |ui| {
+                    if button(ui, p, "Check again", None, Kind::Primary, 44.0, true).clicked() {
+                        check_again = true;
+                    }
+                    ui.add_space(4.0);
+                    if button(ui, p, "Close", None, Kind::Secondary, 44.0, true).clicked() {
+                        close = true;
+                    }
+                });
+            }
+        });
+
+        if update_now {
+            self.start_update_download();
+        }
+        if check_again {
+            self.start_update_check();
+        }
+        if let Some(url) = open_page {
+            let _ = Command::new("explorer").arg(url).spawn();
+        }
+        if close {
+            self.update_open = false;
+        }
+    }
+
     /// Keyboard shortcuts. They stay out of the way while typing or while a window is open.
     fn keyboard(&mut self, ctx: &egui::Context) {
         let modal_open = self.dialog.open
@@ -4894,6 +5228,7 @@ impl App {
             || !self.confirm_delete.is_empty()
             || self.details_id.is_some()
             || self.welcome_open
+            || self.update_open
             || self.sleep_at.is_some();
         if modal_open {
             return;
@@ -5225,8 +5560,23 @@ impl App {
                 let _ = cb.set_text(d.url.clone());
             }
         }
+        // After a finished download, opening the file or its folder is the last thing the
+        // window is needed for, so it closes.
+        let done_and_used = d.status == Status::Complete && (out.folder || out.toggle);
         if out.folder {
             reveal_path(&d.path());
+        }
+        if done_and_used {
+            if out.toggle {
+                open_path(&d.path());
+            }
+            if self.floating == Some(d.id) {
+                self.floating = None;
+            }
+            if self.details_id == Some(d.id) {
+                self.details_id = None;
+            }
+            return;
         }
         if out.cancel {
             // Stop downloading and close the window. The download stays in the list with
@@ -5294,6 +5644,12 @@ impl App {
         let pal = p.clone();
         let mut expanded = self.details_expanded;
         let front = std::mem::take(&mut self.floating_front);
+        // On top of other windows while it is new, then back to a normal window.
+        let on_top = self.floating_top_until.map(|t| Instant::now() < t).unwrap_or(false);
+        let was_on_top = self.floating_top_until.is_some();
+        if !on_top {
+            self.floating_top_until = None;
+        }
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("floating_details"), builder, |ctx, _| {
             // The same branded bar as the main window, not the standard Windows one.
             egui::TopBottomPanel::top("float_bar")
@@ -5342,7 +5698,10 @@ impl App {
             window_frame_and_resize(ctx, &pal);
             if front {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            } else if !on_top && was_on_top {
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
             }
             if out.resized {
                 let h = if expanded { 770.0 } else { 500.0 };
@@ -5886,6 +6245,7 @@ impl eframe::App for App {
         self.sample_speed();
         self.keyboard(ctx);
         self.check_after_finish();
+        self.poll_update();
         // While parked in the tray, tick about once a second: enough to keep downloads,
         // notifications and saving going, and gentle on the CPU.
         ctx.request_repaint_after(Duration::from_millis(if shell::in_tray() { 1000 } else { 120 }));
@@ -5903,6 +6263,7 @@ impl eframe::App for App {
         self.ui_delete_dialog(ctx, &p);
         self.ui_help_dialog(ctx, &p);
         self.ui_welcome(ctx, &p);
+        self.ui_update_dialog(ctx, &p);
         self.ui_floating_details(ctx, &p);
         self.ui_sleep_notice(ctx, &p);
         self.ui_torrent_details(ctx, &p);
