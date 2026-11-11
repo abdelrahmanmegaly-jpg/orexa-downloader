@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Orexa Downloader",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Download files with Orexa Downloader",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqOzL8YF4Tx9GgmR+g2MURCEc2wD3utzmuO7Ou+eBG8VxYrmHHTL4D3UJPAqf+3dbPVA+xgPeT5gkXX2LbUHj1EQC0YPirZw7B8kUF8GcrEmIf/B59eS/uArj/cxDo/L4XW8LwyksBcZG/cuexnJRl+YkXt9ILPfptzRUCb79Qi7x00ubFXbGoX6av4LxwfJUZP7xS/DbgesFyTkXxVkDz0uV26LCq7eRmfwrawzr1z7snB+t2thv9i6flmmvWQouowf3JX2nOVeYwJFiJf0zCbwJIbMY9fDMWr5OBPib0XhH7aiNEhbxASsNHvrT5/2Z2nHMORekks/DPPupGkrI1wIDAQAB",
   "minimum_chrome_version": "110",

@@ -1,5 +1,5 @@
 const $ = (id) => document.getElementById(id);
-const DEFAULTS = { enabled: true, minSizeMB: 0, onlyTypes: "", skipSites: "", showDialog: true, sniff: true };
+const DEFAULTS = { enabled: true, minSizeMB: 0, onlyTypes: "", skipSites: "", showDialog: true, sniff: true, catchImages: false };
 
 async function showStatus() {
   const el = $("status");
@@ -88,11 +88,13 @@ async function init() {
   const cfg = { ...DEFAULTS, ...(await chrome.storage.sync.get(DEFAULTS)) };
   $("enabled").checked = cfg.enabled;
   $("sniff").checked = cfg.sniff;
+  $("catchImages").checked = cfg.catchImages;
   $("minSizeMB").value = cfg.minSizeMB;
   $("onlyTypes").value = cfg.onlyTypes;
   $("skipSites").value = cfg.skipSites;
 
   $("sniff").addEventListener("change", (e) => chrome.storage.sync.set({ sniff: e.target.checked }));
+  $("catchImages").addEventListener("change", (e) => chrome.storage.sync.set({ catchImages: e.target.checked }));
   $("enabled").addEventListener("change", (e) => chrome.storage.sync.set({ enabled: e.target.checked }));
   $("minSizeMB").addEventListener("change", (e) => chrome.storage.sync.set({ minSizeMB: Math.max(0, Number(e.target.value) || 0) }));
   $("onlyTypes").addEventListener("change", (e) => chrome.storage.sync.set({ onlyTypes: e.target.value }));

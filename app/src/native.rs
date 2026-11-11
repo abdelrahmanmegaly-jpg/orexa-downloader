@@ -14,6 +14,65 @@ pub const EXTENSION_IDS: &[&str] = &[
 ];
 pub const HOST_NAME: &str = "com.orexa.downloader";
 
+/// Downloads the app gives back to the browser (the site only lets the browser have them).
+pub fn handback_dir() -> PathBuf {
+    state::data_dir().join("handback")
+}
+
+/// Ask the browser to download `url` itself. The extension collects these.
+pub fn queue_handback(id: u64, url: &str, file_name: &str, referrer: Option<&str>) {
+    let dir = handback_dir();
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let msg = json!({"id": id, "url": url, "filename": file_name, "referrer": referrer.unwrap_or("")});
+    let tmp = dir.join(format!("{}.tmp", id));
+    let fin = dir.join(format!("{}.json", id));
+    if fs::write(&tmp, msg.to_string()).is_ok() {
+        let _ = fs::rename(&tmp, &fin);
+    }
+}
+
+/// Hand-backs waiting for the browser: read and removed. Older than ten minutes are dropped
+/// (the person has moved on by then).
+fn take_handbacks() -> Vec<Value> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(handback_dir()) else { return out };
+    for e in rd.filter_map(|e| e.ok()) {
+        let p = e.path();
+        if p.extension().map(|x| x != "json").unwrap_or(true) {
+            continue;
+        }
+        let fresh = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age < std::time::Duration::from_secs(600))
+            .unwrap_or(false);
+        let text = fs::read_to_string(&p);
+        let _ = fs::remove_file(&p);
+        if !fresh {
+            continue;
+        }
+        if let Ok(v) = text.map_err(|_| ()).and_then(|t| serde_json::from_str::<Value>(&t).map_err(|_| ())) {
+            if v["url"].as_str().map(is_http).unwrap_or(false) {
+                // Tell the app the browser has it now.
+                let dir = inbox_dir();
+                let _ = fs::create_dir_all(&dir);
+                let note = json!({"type": "handback-taken", "id": v["id"].clone()});
+                let tmp = dir.join(format!("taken-{}.tmp", v["id"]));
+                let fin = dir.join(format!("taken-{}.json", v["id"]));
+                if fs::write(&tmp, note.to_string()).is_ok() {
+                    let _ = fs::rename(&tmp, &fin);
+                }
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
 pub fn inbox_dir() -> PathBuf {
     state::data_dir().join("inbox")
 }
@@ -274,6 +333,7 @@ pub fn handle(raw: &[u8]) -> Value {
             let launched = ensure_app(false);
             json!({"ok": true, "launched": launched})
         }
+        Some("handback") => json!({"ok": true, "items": take_handbacks()}),
         Some("cookies") => {
             // The browser's YouTube sign-in, saved privately for yt-dlp.
             let text = msg["text"].as_str().unwrap_or("");

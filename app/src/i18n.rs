@@ -161,6 +161,8 @@ fn fill_template(s: &str, en: &str, tr: &str, table: &[(&str, &str)], depth: u8)
 }
 
 const AR_TEMPLATES: &[(&str, &str)] = &[
+    ("The site refused the download ({}). The link may have expired or need you to be signed in: start it again from the browser.", "رفض الموقع التنزيل ({1}). ربما انتهت صلاحية الرابط أو يلزم تسجيل الدخول: ابدأه مجددًا من المتصفح."),
+    ("The file is no longer there ({})", "الملف لم يعد موجودًا ({1})"),
     ("Version {} is ready. You have {}.", "الإصدار {1} جاهز. لديك {2}."),
     ("Orexa Downloader {} is the newest version.", "Orexa Downloader {1} هو أحدث إصدار."),
     ("Downloading the update: {} of {}", "جارٍ تنزيل التحديث: {1} من {2}"),
@@ -332,6 +334,15 @@ fn ar_exact(s: &str) -> Option<&'static str> {
         "Starting the update. Orexa will close and open again." => "جارٍ بدء التحديث. سيُغلق Orexa ثم يُفتح مرة أخرى.",
         "Could not reach GitHub" => "تعذّر الوصول إلى GitHub",
         "The downloaded file did not match its checksum, so it was not run" => "لم يطابق الملف المنزَّل رمز التحقق الخاص به، لذلك لم يُشغَّل",
+        "The site only lets the browser download this. Waiting for your browser to take it..." => {
+            "يسمح الموقع للمتصفح فقط بتنزيل هذا الملف. في انتظار أن يتولاه متصفحك..."
+        }
+        "Your browser is downloading this (the site only allows the browser)." => "متصفحك يقوم بتنزيل هذا الملف (الموقع يسمح للمتصفح فقط).",
+        "The site refused Orexa; handed back to the browser" => "رفض الموقع Orexa، فأُعيد التنزيل إلى المتصفح",
+        "Your browser took it over" => "تولّى متصفحك التنزيل",
+        "The site only lets the browser download this. Start it again from the browser, or update the Orexa extension so it can take over by itself." => {
+            "يسمح الموقع للمتصفح فقط بتنزيل هذا الملف. ابدأه مجددًا من المتصفح، أو حدّث إضافة Orexa لتتولى ذلك تلقائيًا."
+        }
         "Library" => "المكتبة",
         "Categories" => "الفئات",
         "Settings" => "الإعدادات",

@@ -14,6 +14,7 @@ const DEFAULTS = {
   skipSites: "", // e.g. "example.com, intranet.local"
   showDialog: true, // show the "Download file info" window before anything starts
   sniff: true, // list the videos and audio a page plays, with a Download button
+  catchImages: false, // pictures (PNG, JPG...) stay with the browser unless switched on
 };
 let cfg = { ...DEFAULTS };
 
@@ -96,12 +97,22 @@ function toNetscape(cookies) {
   return lines.join("\n") + "\n";
 }
 
+const IMAGE_EXTS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif", "heic", "heif", "tif", "tiff", "jfif"];
+
+/** A picture: small, quick, and often from sites that only let the browser download. */
+function isImage(item) {
+  if (/^image\//i.test(item.mime || "")) return true;
+  const ext = extOf(item.filename) || extOf(item.finalUrl || item.url);
+  return IMAGE_EXTS.includes(ext);
+}
+
 /** Decide whether a Chrome download should be taken over by Orexa. */
 function shouldCapture(item, c) {
   if (!c.enabled) return false;
   const url = item.finalUrl || item.url;
   if (!isHttp(url)) return false; // blob:, data:, file: cannot be handed over
   if (item.byExtensionId) return false; // started by an extension (including us)
+  if (typeof isOurOwn === "function" && isOurOwn(item)) return false; // our own hand-back
   if (item.state && item.state !== "in_progress") return false;
   const host = hostOf(url);
   if (listFrom(c.skipSites).some((s) => host === s || host.endsWith("." + s))) return false;
@@ -112,6 +123,7 @@ function shouldCapture(item, c) {
   }
   if (c.minSizeMB > 0 && item.fileSize > 0 && item.fileSize < c.minSizeMB * 1048576) return false;
   if (/^text\/html/i.test(item.mime || "") && !extOf(item.filename)) return false; // a page, not a file
+  if (!c.catchImages && isImage(item)) return false; // pictures stay with the browser
   return true;
 }
 
@@ -215,6 +227,7 @@ async function sendToOrexa({ url, filename, referrer, mime, size }) {
   if (reply.ok) {
     flashBadge("OK", "#22D3EE");
     remember({ url, filename: filename || url });
+    watchHandbacks();
     return true;
   }
   flashBadge("!", "#B42318");
@@ -281,7 +294,95 @@ async function handleDownload(item) {
     }
     return;
   }
-  if (!r.dialog) await dropChromeDownload(item.id); // sent straight to Orexa
+  if (!r.dialog) handOverChromeCopy(item.id, item.finalUrl || item.url); // sent straight to Orexa
+}
+
+// ---------------------------------------------------------------------------
+// Hand-backs: some sites refuse every program but the browser itself (they check the browser's
+// sign-in and network fingerprint). When Orexa is refused like that, it gives the link back and
+// the browser downloads it normally. After each hand-over to Orexa, we ask for a minute.
+// ---------------------------------------------------------------------------
+
+let handbackTimer = null;
+let handbackUntil = 0;
+// Chrome's own copy of a download handed to Orexa is kept, paused, for a few seconds. If the
+// site refuses Orexa, that same download just carries on in the browser: a fresh request could
+// be refused too (many sites give out one-time links).
+const heldForOrexa = new Map(); // url sent to Orexa -> Chrome download id
+const HOLD_MS = 10 * 1000;
+// Links this extension itself starts in the browser, so they are never captured again.
+const startedByUs = new Map(); // url -> time
+
+function watchHandbacks() {
+  handbackUntil = Date.now() + 60 * 1000;
+  if (!handbackTimer) scheduleHandbackCheck();
+}
+
+function scheduleHandbackCheck() {
+  handbackTimer = setTimeout(async () => {
+    handbackTimer = null;
+    const r = await sendNative({ type: "handback" });
+    for (const h of (r && r.ok && r.items) || []) await takeBack(h);
+    if (Date.now() < handbackUntil) scheduleHandbackCheck();
+  }, 1500);
+}
+
+/** Orexa gave a download back: let the browser finish it. */
+async function takeBack(h) {
+  if (!h || !isHttp(h.url)) return;
+  const held = heldForOrexa.get(h.url);
+  if (held !== undefined) {
+    // Chrome's own download is still waiting: carry on with it.
+    heldForOrexa.delete(h.url);
+    answerFilename(held);
+    try {
+      await chrome.downloads.resume(held);
+      flashBadge("↓", "#22D3EE");
+      return;
+    } catch {
+      /* it is gone after all: start a new one below */
+    }
+  }
+  await downloadInBrowser(h);
+}
+
+/** Keep Chrome's paused copy for a while; drop it once Orexa has clearly taken the download. */
+function handOverChromeCopy(id, url) {
+  if (id === undefined || id === null) return;
+  heldForOrexa.set(url, id);
+  watchHandbacks();
+  const timer = setTimeout(async () => {
+    if (heldForOrexa.get(url) === id) {
+      heldForOrexa.delete(url);
+      await dropChromeDownload(id);
+    }
+  }, HOLD_MS);
+  if (timer && timer.unref) timer.unref();
+}
+
+/** The browser's own download (started by this extension, so it is not captured again). */
+async function downloadInBrowser(h) {
+  if (!h || !isHttp(h.url)) return;
+  startedByUs.set(h.url, Date.now());
+  const opts = { url: h.url, conflictAction: "uniquify" };
+  const name = baseName(h.filename || "");
+  if (name && !/[\\/:*?"<>|]/.test(name)) opts.filename = name;
+  try {
+    await chrome.downloads.download(opts);
+    flashBadge("↓", "#22D3EE");
+  } catch {
+    try {
+      await chrome.downloads.download({ url: h.url }); // without the name, if Chrome disliked it
+    } catch {
+      /* nothing more we can do */
+    }
+  }
+}
+
+function isOurOwn(item) {
+  const now = Date.now();
+  for (const [u, t] of startedByUs) if (now - t > 60 * 1000) startedByUs.delete(u);
+  return startedByUs.has(item.url) || startedByUs.has(item.finalUrl);
 }
 
 // ---------------------------------------------------------------------------
@@ -749,10 +850,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (rec) {
         rec.decided = true;
         await chrome.storage.session.set({ [DLG + msg.token]: rec });
-        await dropChromeDownload(rec.downloadId); // Orexa has it, or the user cancelled
+        if (msg.action === "cancel") await dropChromeDownload(rec.downloadId);
+        else handOverChromeCopy(rec.downloadId, rec.url); // dropped once Orexa clearly has it
         if (msg.action !== "cancel") {
           flashBadge("OK", "#22D3EE");
           remember({ url: rec.url, filename: rec.filename || rec.url });
+          watchHandbacks();
         }
       }
       sendResponse({ ok: true });
@@ -793,8 +896,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // Exported for tests (Node), ignored by Chrome.
 if (typeof module !== "undefined") {
   module.exports = {
-    shouldCapture, listFrom, extOf, baseName, hostOf, isHttp, isMagnet, isYoutube, toNetscape,
+    shouldCapture, isImage, listFrom, extOf, baseName, hostOf, isHttp, isMagnet, isYoutube, toNetscape,
     sniffMedia, mediaKey, friendlyMediaName, addMedia, classifyManifest, selectPlayed, facebookVideoUrl,
-    requestDownload, handleDownload, onDeterminingFilename, dropChromeDownload, setConfigForTests: (c) => { cfg = { ...cfg, ...c }; },
+    requestDownload, handleDownload, onDeterminingFilename, dropChromeDownload, downloadInBrowser, takeBack, handOverChromeCopy, setConfigForTests: (c) => { cfg = { ...cfg, ...c }; },
   };
 }

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.9 (extension 0.1.7)
+
+### Added
+- **Install for "Only me" or "All users".** The installer now asks. **Only me** needs no administrator rights, so Orexa installs on computers without admin access. **All users** installs in Program Files and asks Windows for permission.
+- **Browser fallback.** When a site only lets the browser download a file, Orexa hands it back and your browser finishes it.
+
+### Improved
+- **Fewer failed downloads on file hosts.** Sites that allow only one or two connections at a time (like pixeldrain) now work. Orexa uses fewer connections and waits when the site asks, instead of failing after six interrupted parts.
+- **Fewer "403 Forbidden" errors.** Orexa asks for files the way a browser does. If a site still refuses, it retries with different settings before giving up.
+- **Pictures stay in the browser.** PNG, JPG and other images download in the browser as usual. You can turn on **Also catch images** in the extension's options.
+- **Clearer error messages** when a site refuses a download, limits downloads, or the file is gone.
+
+### Fixed
+- Multi-connection downloads failed with "The connection kept failing" on sites that limit connections.
+
+### Removed
+- Nothing in this release.
+
 ## 0.1.8
 
 The browser extension is unchanged (still 0.1.6); this update is for the app and installer.

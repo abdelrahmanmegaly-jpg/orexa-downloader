@@ -10,7 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -52,24 +52,22 @@ pub fn saved_progress(file: &Path) -> Option<u64> {
     Some(s.done.iter().sum())
 }
 
-fn with_headers(mut req: RequestBuilder, d: &Download) -> RequestBuilder {
-    if let Some(r) = &d.extra.referer {
-        req = req.header("Referer", r);
-    }
-    if let Some(c) = &d.extra.cookie {
-        req = req.header("Cookie", c);
-    }
-    req
+/// A part request with a browser's headers (`d.extra.referer` is the Referer that worked).
+fn part_request(client: &Client, d: &Download) -> RequestBuilder {
+    crate::web::browser_get(client, &d.url, d.extra.referer.as_deref(), d.extra.cookie.as_deref())
 }
 
-/// Ask for the first byte: a 206 answer with a total means ranges work.
-fn probe_ranges(client: &Client, d: &Download) -> Option<u64> {
-    let resp = with_headers(client.get(&d.url), d).header("Range", "bytes=0-0").send().ok()?;
+/// Ask for the first byte: a 206 answer with a total means ranges work. Also returns the
+/// Referer the server accepted.
+fn probe_ranges(client: &Client, d: &Download) -> Option<(u64, Option<String>)> {
+    let (resp, referer) =
+        crate::web::get_tolerant(client, &d.url, d.extra.referer.as_deref(), d.extra.cookie.as_deref(), Some("bytes=0-0")).ok()?;
     if resp.status().as_u16() != 206 {
         return None;
     }
     let cr = resp.headers().get("content-range")?.to_str().ok()?.to_string();
-    cr.rsplit('/').next()?.trim().parse::<u64>().ok().filter(|t| *t > 0)
+    let total = cr.rsplit('/').next()?.trim().parse::<u64>().ok().filter(|t| *t > 0)?;
+    Some((total, referer))
 }
 
 fn load_side(file: &Path, d: &Download) -> Option<Side> {
@@ -97,6 +95,8 @@ pub fn run(
     cmd_rx: &Receiver<WorkerCmd>,
     ev_tx: &Sender<EngineEvent>,
 ) -> Outcome {
+    // The Referer to send with every part: the one the server accepted when asked first.
+    let mut referer = crate::web::referer_choices(&d.url, d.extra.referer.as_deref()).into_iter().next().flatten();
     // Resume from the side file, or start fresh when the server allows ranges.
     let mut side = match load_side(path, d) {
         Some(s) => s,
@@ -105,7 +105,8 @@ pub fn run(
             if fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
                 return Outcome::Fallback;
             }
-            let Some(total) = probe_ranges(client, d) else { return Outcome::Fallback };
+            let Some((total, accepted)) = probe_ranges(client, d) else { return Outcome::Fallback };
+            referer = accepted;
             if total < MIN_SIZE {
                 return Outcome::Fallback;
             }
@@ -124,6 +125,9 @@ pub fn run(
         }
     };
 
+    let mut with_ref = d.clone();
+    with_ref.extra.referer = referer;
+    let d = &with_ref;
     let size = side.size;
     let n = side.done.len();
     let done: Arc<Vec<AtomicU64>> = Arc::new(side.done.iter().map(|x| AtomicU64::new(*x)).collect());
@@ -135,6 +139,7 @@ pub fn run(
     let alive = Arc::new(AtomicBool::new(true));
 
     let threads = CONNECTIONS.min(n);
+    let limit = Arc::new(Limit { allowed: AtomicUsize::new(threads), active: AtomicUsize::new(threads) });
     let already = total_got.load(Ordering::Relaxed);
     let _ = ev_tx.send(EngineEvent::Log(
         d.id,
@@ -154,9 +159,13 @@ pub fn run(
             failed.clone(),
             finished_threads.clone(),
         );
-        let (client, d, path, side, ev) = (client.clone(), d.clone(), path.to_path_buf(), side.clone(), ev_tx.clone());
+        let (client, d, path, side, ev, limit) =
+            (client.clone(), d.clone(), path.to_path_buf(), side.clone(), ev_tx.clone(), limit.clone());
         thread::spawn(move || {
-            worker(&client, &d, &path, &side, &done, &total_got, &claimed, &control, &failed, &ev);
+            let left = worker(&client, &d, &path, &side, &done, &total_got, &claimed, &control, &failed, &ev, &limit);
+            if !left {
+                limit.active.fetch_sub(1, Ordering::SeqCst);
+            }
             finished_threads.fetch_add(1, Ordering::SeqCst);
         });
     }
@@ -207,6 +216,12 @@ pub fn run(
 
         if let Some(e) = failed.lock().unwrap().clone() {
             control.store(STOP, Ordering::SeqCst);
+            // Refused by a site that only lets the browser download: give it back.
+            if e.starts_with("The site refused") && d.extra.from_browser {
+                let _ = fs::remove_file(side_path(path));
+                let _ = ev_tx.send(EngineEvent::HandBack(d.id));
+                return Outcome::Handled;
+            }
             snapshot(&mut side);
             save_side(path, &side);
             let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(e)));
@@ -270,16 +285,21 @@ fn worker(
     control: &AtomicU8,
     failed: &Mutex<Option<String>>,
     ev: &Sender<EngineEvent>,
-) {
+    limit: &Limit,
+) -> bool {
     let Ok(file) = OpenOptions::new().write(true).open(path) else {
         *failed.lock().unwrap() = Some("Could not open the file".into());
-        return;
+        return false;
     };
     let mut buf = vec![0u8; 128 * 1024];
 
     loop {
         if control.load(Ordering::SeqCst) == STOP {
-            return;
+            return false;
+        }
+        // The site wants fewer connections: this one steps aside.
+        if limit.try_leave() {
+            return true;
         }
         // Take the next chunk nobody has and that is not finished.
         let idx = {
@@ -295,7 +315,7 @@ fn worker(
             }
             match pick {
                 Some(i) => i,
-                None => return,
+                None => return false,
             }
         };
         let (start, end) = chunk_bounds(side, idx);
@@ -306,12 +326,31 @@ fn worker(
             if have >= end - start {
                 break;
             }
-            match fetch(client, d, &file, start + have, end - 1, &mut buf, &done[idx], total_got, control) {
-                Ok(()) => {}
-                Err(Stop) => return,
-            }
+            let r = match fetch(client, d, &file, start + have, end - 1, &mut buf, &done[idx], total_got, control) {
+                Ok(r) => r,
+                Err(Stop) => return false,
+            };
             if done[idx].load(Ordering::Relaxed) >= end - start {
                 break;
+            }
+            if r.got > 0 {
+                // It moved on before the connection dropped: carry on from there.
+                attempts = 0;
+                continue;
+            }
+            // Refused or dropped before sending anything. Many sites allow only a few
+            // connections at once: use one fewer and let this part wait for a free one.
+            if let Some(now) = limit.lower() {
+                let _ = ev.send(EngineEvent::Log(
+                    d.id,
+                    format!("The site allows fewer connections, now using {}", now),
+                ));
+                claimed.lock().unwrap()[idx] = false;
+                if limit.try_leave() {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(300));
+                continue;
             }
             attempts += 1;
             let _ = ev.send(EngineEvent::Log(
@@ -319,15 +358,71 @@ fn worker(
                 format!("Part {} was interrupted, trying again ({} of {})", idx + 1, attempts, RETRIES),
             ));
             if attempts > RETRIES {
-                *failed.lock().unwrap() = Some("The connection kept failing. Try again.".into());
-                return;
+                let why = match r.refused {
+                    Some(401) | Some(403) => "The site refused the download. The link may have expired or need you to be signed in: start it again from the browser.",
+                    Some(429) => "The site says too many downloads at once. Wait a little, then try again.",
+                    _ => "The connection kept failing. Try again.",
+                };
+                *failed.lock().unwrap() = Some(why.into());
+                return false;
             }
-            thread::sleep(Duration::from_millis(400 * attempts as u64));
+            // Wait as long as the site asks (within reason), or a little longer each time.
+            let wait = match (r.refused, r.retry_after) {
+                (_, Some(secs)) => Duration::from_secs(secs.min(30)),
+                (Some(429), None) | (Some(503), None) => Duration::from_secs(3 * attempts as u64),
+                _ => Duration::from_millis(400 * attempts as u64),
+            };
+            thread::sleep(wait);
         }
     }
 }
 
 struct Stop;
+
+/// How many connections the site lets us use. It starts at CONNECTIONS and goes down each time
+/// a connection is refused or dropped before sending anything, down to one.
+struct Limit {
+    allowed: AtomicUsize,
+    active: AtomicUsize,
+}
+
+impl Limit {
+    /// One fewer connection from now on (never below one). Returns the new number when it
+    /// actually went down.
+    fn lower(&self) -> Option<usize> {
+        let mut cur = self.allowed.load(Ordering::SeqCst);
+        while cur > 1 {
+            match self.allowed.compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(cur - 1),
+                Err(now) => cur = now,
+            }
+        }
+        None
+    }
+
+    /// Leave if there are more connections than allowed. At least one always stays.
+    fn try_leave(&self) -> bool {
+        loop {
+            let a = self.active.load(Ordering::SeqCst);
+            if a <= 1 || a <= self.allowed.load(Ordering::SeqCst) {
+                return false;
+            }
+            if self.active.compare_exchange(a, a - 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return true;
+            }
+        }
+    }
+}
+
+/// What one request for a part brought.
+struct Fetched {
+    /// Bytes stored.
+    got: u64,
+    /// The answer, when it was not a part (206).
+    refused: Option<u16>,
+    /// The server asked to wait this many seconds.
+    retry_after: Option<u64>,
+}
 
 /// Fetch bytes `from..=to` and store them. Returns Err(Stop) when asked to stop; a
 /// network error just returns Ok so the caller retries from where it got to.
@@ -342,11 +437,18 @@ fn fetch(
     chunk_done: &AtomicU64,
     total_got: &AtomicU64,
     control: &AtomicU8,
-) -> Result<(), Stop> {
-    let req = with_headers(client.get(&d.url), d).header("Range", format!("bytes={}-{}", from, to));
-    let Ok(mut resp) = req.send() else { return Ok(()) };
+) -> Result<Fetched, Stop> {
+    let mut out = Fetched { got: 0, refused: None, retry_after: None };
+    let req = part_request(client, d).header("Range", format!("bytes={}-{}", from, to));
+    let Ok(mut resp) = req.send() else { return Ok(out) };
     if resp.status().as_u16() != 206 {
-        return Ok(()); // counts as a failed attempt
+        out.refused = Some(resp.status().as_u16());
+        out.retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        return Ok(out);
     }
     let mut pos = from;
     loop {
@@ -360,23 +462,24 @@ fn fetch(
         }
         let want = ((to + 1 - pos) as usize).min(buf.len());
         if want == 0 {
-            return Ok(());
+            return Ok(out);
         }
         match resp.read(&mut buf[..want]) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(out),
             Ok(n) => {
                 let mut off = 0usize;
                 while off < n {
                     match file.seek_write(&buf[off..n], pos + off as u64) {
                         Ok(w) if w > 0 => off += w,
-                        _ => return Ok(()),
+                        _ => return Ok(out),
                     }
                 }
                 pos += n as u64;
                 chunk_done.fetch_add(n as u64, Ordering::Relaxed);
                 total_got.fetch_add(n as u64, Ordering::Relaxed);
+                out.got += n as u64;
             }
-            Err(_) => return Ok(()),
+            Err(_) => return Ok(out),
         }
     }
 }

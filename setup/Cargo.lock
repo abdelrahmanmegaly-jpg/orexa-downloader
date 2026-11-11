@@ -2273,7 +2273,7 @@ dependencies = [
 
 [[package]]
 name = "orexa-setup"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "eframe",
  "flate2",

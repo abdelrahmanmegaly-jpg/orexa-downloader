@@ -8,6 +8,7 @@ mod shell;
 mod state;
 mod torrent;
 mod update;
+mod web;
 mod youtube;
 
 use std::collections::{BTreeMap, HashMap};
@@ -178,6 +179,8 @@ struct Extra {
     referer: Option<String>,
     cookie: Option<String>,
     user_agent: Option<String>,
+    /// The link came from the browser, which can download it itself if the site refuses Orexa.
+    from_browser: bool,
 }
 
 impl Download {
@@ -463,6 +466,8 @@ enum EngineEvent {
     Log(u64, String),
     /// How many connections the download uses right now.
     Conns(u64, usize),
+    /// The site refused Orexa but would let the browser download it: give it back.
+    HandBack(u64),
 }
 
 struct Engine {
@@ -561,7 +566,7 @@ fn download_worker(d: Download, cmd_rx: Receiver<WorkerCmd>, ev_tx: Sender<Engin
             d.extra
                 .user_agent
                 .clone()
-                .unwrap_or_else(|| "Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string()),
+                .unwrap_or_else(|| web::DEFAULT_UA.to_string()),
         )
         .timeout(None)
         .build()
@@ -585,25 +590,21 @@ fn download_worker(d: Download, cmd_rx: Receiver<WorkerCmd>, ev_tx: Sender<Engin
         return;
     }
 
-    let mut req = client.get(&d.url);
-    if let Some(r) = &d.extra.referer {
-        req = req.header("Referer", r);
-    }
-    if let Some(c) = &d.extra.cookie {
-        req = req.header("Cookie", c);
-    }
-    if downloaded > 0 {
-        req = req.header("Range", format!("bytes={}-", downloaded));
-    }
+    // Asked like a browser; a refusal is tried again with another Referer.
+    let range = (downloaded > 0).then(|| format!("bytes={}-", downloaded));
+    let sent = web::get_tolerant(&client, &d.url, d.extra.referer.as_deref(), d.extra.cookie.as_deref(), range.as_deref())
+        .map(|(r, _)| r);
 
-    let mut resp = match req.send() {
+    let mut resp = match sent {
         Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => r,
         Ok(r) => {
-            let _ = ev_tx.send(EngineEvent::State(
-                d.id,
-                Status::Error,
-                Some(format!("Server answered {}", r.status())),
-            ));
+            // Refused before anything arrived, for a link the browser gave us: the browser,
+            // with its own sign-in, can still download it.
+            if matches!(r.status().as_u16(), 401 | 403) && downloaded == 0 && d.extra.from_browser {
+                let _ = ev_tx.send(EngineEvent::HandBack(d.id));
+                return;
+            }
+            let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(web::status_message(r.status()))));
             return;
         }
         Err(e) => {
@@ -2103,7 +2104,7 @@ fn name_from_disposition(v: &str) -> Option<String> {
 fn probe_link(url: &str) -> Result<(u64, Option<String>), String> {
     use reqwest::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
     let client = reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        .user_agent(web::DEFAULT_UA)
         .timeout(Duration::from_secs(12))
         .build()
         .map_err(|e| e.to_string())?;
@@ -2132,7 +2133,12 @@ fn probe_link(url: &str) -> Result<(u64, Option<String>), String> {
     };
 
     // First choice: a HEAD request.
-    if let Ok(r) = client.head(url).send() {
+    let site = web::origin(url);
+    let mut head = client.head(url).header("Accept-Language", "en-US,en;q=0.9");
+    if let Some(o) = &site {
+        head = head.header("Referer", o);
+    }
+    if let Ok(r) = head.send() {
         if r.status().is_success() {
             if let Some(len) = len_of(&r).filter(|l| *l > 0) {
                 return Ok((len, name_of(&r)));
@@ -2140,11 +2146,8 @@ fn probe_link(url: &str) -> Result<(u64, Option<String>), String> {
         }
     }
     // Fallback: ask for one byte and read the total from Content-Range.
-    let r = client
-        .get(url)
-        .header(RANGE, "bytes=0-0")
-        .send()
-        .map_err(|e| e.to_string())?;
+    let _ = RANGE;
+    let (r, _) = web::get_tolerant(&client, url, None, None, Some("bytes=0-0")).map_err(|e| e.to_string())?;
     if !r.status().is_success() {
         return Err(format!("Server answered {}", r.status()));
     }
@@ -2288,6 +2291,9 @@ struct App {
     /// The installer is on its way: the app closes for it.
     update_launched: bool,
     update_closing: Option<Instant>,
+    /// Downloads given back to the browser and when; if the browser never collects one (an
+    /// older extension), the row says what to do instead.
+    handbacks: HashMap<u64, Instant>,
     /// Keep the pop-up above other windows until then (so a finished download is seen).
     floating_top_until: Option<Instant>,
     after_finish: AfterFinish,
@@ -2416,6 +2422,7 @@ impl App {
             update_error: None,
             update_launched: false,
             update_closing: None,
+            handbacks: HashMap::new(),
             after_finish: AfterFinish::Nothing,
             batch_done: false,
             last_done_dir: None,
@@ -2621,6 +2628,17 @@ impl App {
     }
 
     fn handle_browser_link(&mut self, ctx: &egui::Context, v: &serde_json::Value) {
+        // The browser picked up a download Orexa handed back: it is the browser's now.
+        if v["type"].as_str() == Some("handback-taken") {
+            if let Some(id) = v["id"].as_u64() {
+                self.handbacks.remove(&id);
+                if let Some(d) = self.downloads.iter_mut().find(|x| x.id == id) {
+                    d.error = Some("Your browser is downloading this (the site only allows the browser).".into());
+                    d.live.note("Your browser took it over");
+                }
+            }
+            return;
+        }
         let text = |k: &str| {
             v[k].as_str()
                 .map(str::trim)
@@ -2643,7 +2661,7 @@ impl App {
         }
         self.recent_browser.push((url.clone(), Instant::now()));
 
-        let extra = Extra { referer: text("referrer"), cookie: text("cookie"), user_agent: text("userAgent") };
+        let extra = Extra { referer: text("referrer"), cookie: text("cookie"), user_agent: text("userAgent"), from_browser: true };
         let suggested = text("filename").map(|n| clean_name(&n));
         // "now" or "queue" means the browser dialog already asked the user.
         let mode = text("mode");
@@ -3190,6 +3208,20 @@ impl App {
                 EngineEvent::Log(id, msg) => {
                     if let Some(d) = self.downloads.iter_mut().find(|x| x.id == id) {
                         d.live.note(msg);
+                    }
+                }
+                EngineEvent::HandBack(id) => {
+                    if let Some(d) = self.downloads.iter_mut().find(|x| x.id == id) {
+                        native::queue_handback(d.id, &d.url, &d.file_name, d.extra.referer.as_deref());
+                        self.handbacks.insert(d.id, Instant::now());
+                        d.status = Status::Error;
+                        d.speed_bps = 0.0;
+                        d.error = Some("The site only lets the browser download this. Waiting for your browser to take it...".into());
+                        d.live.note("The site refused Orexa; handed back to the browser");
+                        let _ = fs::remove_file(d.path());
+                    }
+                    if self.floating == Some(id) {
+                        self.floating = None;
                     }
                 }
                 EngineEvent::Conns(id, n) => {
@@ -6245,6 +6277,22 @@ impl eframe::App for App {
         self.sample_speed();
         self.keyboard(ctx);
         self.check_after_finish();
+        // A hand-back nobody collected (the browser extension is an older version).
+        let stale: Vec<u64> = self
+            .handbacks
+            .iter()
+            .filter(|(_, t)| t.elapsed() > Duration::from_secs(90))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            self.handbacks.remove(&id);
+            if let Some(d) = self.downloads.iter_mut().find(|x| x.id == id) {
+                d.error = Some(
+                    "The site only lets the browser download this. Start it again from the browser, or update the Orexa extension so it can take over by itself."
+                        .into(),
+                );
+            }
+        }
         self.poll_update();
         // While parked in the tray, tick about once a second: enough to keep downloads,
         // notifications and saving going, and gentle on the CPU.

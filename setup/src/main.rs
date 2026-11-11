@@ -6,7 +6,7 @@
 //   settings are kept.
 // - The installed copy of this file is the uninstaller (--uninstall).
 //
-// Scripted use:  Orexa-Downloader-Setup.exe --silent [--dir "D:\Apps\Orexa"] [--no-desktop] [--launch]
+// Scripted use:  Orexa-Downloader-Setup.exe --silent [--all-users | --current-user] [--dir "D:\Apps\Orexa"] [--no-desktop] [--launch]
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::fs;
@@ -54,6 +54,8 @@ static EXTENSION_FILES: &[(&str, &[u8])] = &[
 const VERSION: &str = env!("APP_VERSION");
 const KEY: &str = r"HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall\OrexaDownloader";
 const OLD_USER_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\OrexaDownloader";
+/// The per-user uninstall entry (an earlier version also installed this way).
+const USER_KEY: &str = OLD_USER_KEY;
 const NO_WINDOW: u32 = 0x0800_0000;
 
 // Brand colours (Orexa palette).
@@ -85,8 +87,77 @@ fn program_files() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
 }
 
+/// Who the program is installed for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Scope {
+    /// Every user of this computer. Needs administrator rights (Program Files, all-users
+    /// shortcuts, the machine-wide uninstall entry).
+    AllUsers,
+    /// Only the person running setup. Needs no administrator rights: everything lives in
+    /// that person's own folders and registry.
+    CurrentUser,
+}
+
+impl Scope {
+    fn key(self) -> &'static str {
+        match self {
+            Scope::AllUsers => KEY,
+            Scope::CurrentUser => USER_KEY,
+        }
+    }
+    /// The Windows folders the shortcuts go in: (desktop, start menu programs).
+    fn shortcut_folders(self) -> (&'static str, &'static str) {
+        match self {
+            Scope::AllUsers => ("CommonDesktopDirectory", "CommonPrograms"),
+            Scope::CurrentUser => ("Desktop", "Programs"),
+        }
+    }
+}
+
+fn default_dir_for(scope: Scope) -> PathBuf {
+    match scope {
+        Scope::AllUsers => program_files().join("Orexa Downloader"),
+        Scope::CurrentUser => env_path("LOCALAPPDATA")
+            .map(|l| l.join("Programs"))
+            .unwrap_or_else(|| env_path("USERPROFILE").unwrap_or_else(|| PathBuf::from(r"C:\Users\Public")))
+            .join("Orexa Downloader"),
+    }
+}
+
 fn default_dir() -> PathBuf {
-    program_files().join("Orexa Downloader")
+    default_dir_for(Scope::AllUsers)
+}
+
+/// Does this run need administrator rights? Only an all-users install, or removing one, does.
+/// The wizard itself asks later, when "All users" is chosen.
+fn needs_admin(
+    uninstall_mode: bool,
+    silent: bool,
+    scope_arg: Option<Scope>,
+    existing: Option<Scope>,
+    removing_all_users_copy: bool,
+) -> bool {
+    if uninstall_mode {
+        return removing_all_users_copy;
+    }
+    if !silent {
+        return false;
+    }
+    match (scope_arg, existing) {
+        (Some(s), _) => s == Scope::AllUsers,
+        (None, Some(e)) => e == Scope::AllUsers,
+        // Scripted installs have always been all-users unless told otherwise.
+        (None, None) => true,
+    }
+}
+
+/// Is `dir` an all-users install (so that changing or removing it needs administrator rights)?
+fn dir_needs_admin(dir: &Path) -> bool {
+    let lower = dir.to_string_lossy().to_lowercase();
+    if lower.starts_with(&program_files().to_string_lossy().to_lowercase()) {
+        return true;
+    }
+    reg_get(KEY, "InstallLocation").map(|l| l.to_lowercase() == lower).unwrap_or(false)
 }
 
 fn is_elevated() -> bool {
@@ -189,22 +260,29 @@ fn replace_file(tmp: &Path, dest: &Path) -> Result<(), String> {
 struct Existing {
     dir: PathBuf,
     version: String,
+    scope: Scope,
 }
 
 fn find_existing() -> Option<Existing> {
-    let dir = reg_get(KEY, "InstallLocation")?;
-    if dir.is_empty() {
-        return None;
+    for scope in [Scope::AllUsers, Scope::CurrentUser] {
+        let key = scope.key();
+        if let Some(dir) = reg_get(key, "InstallLocation") {
+            if !dir.is_empty() {
+                return Some(Existing {
+                    dir: PathBuf::from(dir),
+                    version: reg_get(key, "DisplayVersion").unwrap_or_default(),
+                    scope,
+                });
+            }
+        }
     }
-    Some(Existing {
-        dir: PathBuf::from(dir),
-        version: reg_get(KEY, "DisplayVersion").unwrap_or_default(),
-    })
+    None
 }
 
 #[derive(Clone)]
 struct InstallOpts {
     dir: PathBuf,
+    scope: Scope,
     desktop: bool,
     /// Dry run: no closing apps, no shortcuts, no registry, no launch.
     test: bool,
@@ -245,8 +323,10 @@ fn install(opts: &InstallOpts, report: &dyn Fn(f32, &str)) -> Result<(), String>
     if !opts.test {
         report(0.05, "Closing Orexa Downloader...");
         stop_app();
-        report(0.12, "Looking for an older copy...");
-        migrate_old_user_install();
+        if opts.scope == Scope::AllUsers {
+            report(0.12, "Looking for an older copy...");
+            migrate_old_user_install();
+        }
     }
 
     report(0.2, "Unpacking the app...");
@@ -287,6 +367,7 @@ fn install(opts: &InstallOpts, report: &dyn Fn(f32, &str)) -> Result<(), String>
     }
 
     report(0.75, "Creating shortcuts...");
+    let (desk_folder, prog_folder) = opts.scope.shortcut_folders();
     let desktop = if opts.desktop {
         format!(
             "$l = $s.CreateShortcut((Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'Orexa Downloader.lnk')); \
@@ -308,7 +389,9 @@ fn install(opts: &InstallOpts, report: &dyn Fn(f32, &str)) -> Result<(), String>
         desktop = desktop,
         exe = q(&exe),
         dir = q(dir)
-    ));
+    )
+    .replace("CommonDesktopDirectory", desk_folder)
+    .replace("CommonPrograms", prog_folder));
 
     // Offer the browser extension: Chrome, Brave and Edge ask the person, the next time they
     // start, whether to turn it on.
@@ -349,11 +432,12 @@ fn install(opts: &InstallOpts, report: &dyn Fn(f32, &str)) -> Result<(), String>
         ("NoModify", "REG_DWORD", "1"),
         ("NoRepair", "REG_DWORD", "1"),
     ] {
-        reg_set(KEY, name, kind, value);
+        reg_set(opts.scope.key(), name, kind, value);
     }
     // Torrents open a network port. Allowing the app in the firewall now means Windows
-    // never has to ask the person later (failing here is harmless).
-    if !opts.test {
+    // never has to ask the person later (it needs administrator rights, so a per-user install
+    // leaves it to Windows' own prompt).
+    if !opts.test && opts.scope == Scope::AllUsers {
         let _ = hidden("netsh").args(["advfirewall", "firewall", "delete", "rule", "name=Orexa Downloader"]).status();
         let _ = hidden("netsh")
             .args([
@@ -473,6 +557,11 @@ enum Page {
 
 struct Wizard {
     page: Page,
+    scope: Scope,
+    /// The location was typed or chosen, so changing the scope no longer changes it.
+    dir_custom: bool,
+    /// Windows did not give administrator rights.
+    elevate_failed: bool,
     dir: String,
     desktop: bool,
     purge: bool,
@@ -559,6 +648,8 @@ impl Wizard {
         cc: &eframe::CreationContext<'_>,
         uninstall_mode: bool,
         dir: Option<PathBuf>,
+        scope_arg: Option<Scope>,
+        auto_install: bool,
         test: bool,
         shot: Option<String>,
         preview: Option<String>,
@@ -574,15 +665,26 @@ impl Wizard {
             )
         });
         let existing = if test || shot.is_some() { None } else { find_existing() };
+        // An existing copy keeps the way it was installed. A new one starts as "only me":
+        // it works on every computer, including ones without administrator rights.
+        let scope = existing
+            .as_ref()
+            .map(|e| e.scope)
+            .or(scope_arg)
+            .unwrap_or(if is_elevated() { Scope::AllUsers } else { Scope::CurrentUser });
+        let dir_custom = dir.is_some();
         let dir = dir
             .or_else(|| existing.as_ref().map(|e| e.dir.clone()))
-            .unwrap_or_else(default_dir);
+            .unwrap_or_else(|| default_dir_for(scope));
         let here = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| dir.clone());
         let mut w = Self {
             page: if uninstall_mode { Page::ConfirmRemove } else { Page::Welcome },
+            scope,
+            dir_custom,
+            elevate_failed: false,
             dir: dir.display().to_string(),
             desktop: true,
             purge: false,
@@ -597,7 +699,19 @@ impl Wizard {
         };
         // Layout previews for screenshots.
         match preview.as_deref() {
-            Some("update") => w.existing = Some(Existing { dir: default_dir(), version: "0.0.9".into() }),
+            Some("update") => {
+                w.existing = Some(Existing { dir: default_dir(), version: "0.0.9".into(), scope: Scope::AllUsers });
+                w.scope = Scope::AllUsers;
+            }
+            Some("update-user") => {
+                w.existing = Some(Existing { dir: default_dir_for(Scope::CurrentUser), version: "0.0.9".into(), scope: Scope::CurrentUser });
+                w.scope = Scope::CurrentUser;
+            }
+            Some("all") => w.scope = Scope::AllUsers,
+            Some("elevate-failed") => {
+                w.scope = Scope::AllUsers;
+                w.elevate_failed = true;
+            }
             Some("working") => {
                 w.page = Page::Working;
                 *w.progress.lock().unwrap() =
@@ -615,12 +729,41 @@ impl Wizard {
             Some("removed") => w.page = Page::Removed,
             _ => {}
         }
+        if auto_install {
+            // Started again with administrator rights for an all-users install.
+            w.scope = Scope::AllUsers;
+            w.start_install();
+        }
         w
+    }
+
+    /// Install for all users needs administrator rights: ask Windows, and carry on in the
+    /// elevated copy of this program.
+    fn elevate_for_install(&mut self, ctx: &egui::Context) {
+        let args = vec![
+            "--auto-install".to_string(),
+            "--all-users".to_string(),
+            "--dir".to_string(),
+            self.dir.trim().to_string(),
+        ]
+        .into_iter()
+        .chain(if self.desktop { None } else { Some("--no-desktop".to_string()) })
+        .collect::<Vec<_>>();
+        if relaunch_elevated(&args) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            self.elevate_failed = true;
+        }
     }
 
     fn start_install(&mut self) {
         self.page = Page::Working;
-        let opts = InstallOpts { dir: PathBuf::from(self.dir.trim()), desktop: self.desktop, test: self.test };
+        let opts = InstallOpts {
+            dir: PathBuf::from(self.dir.trim()),
+            scope: self.scope,
+            desktop: self.desktop,
+            test: self.test,
+        };
         let prog = self.progress.clone();
         thread::spawn(move || {
             let report = |f: f32, t: &str| {
@@ -715,7 +858,7 @@ impl Wizard {
             if updating { "Update Orexa Downloader" } else { "Install Orexa Downloader" },
             &format!("Version {}", VERSION),
         );
-        ui.add_space(14.0);
+        ui.add_space(10.0);
         let intro = match &self.existing {
             Some(e) if !e.version.is_empty() => format!(
                 "Version {} is installed. This updates it to {} and replaces the old files. Your downloads and settings are kept.",
@@ -725,7 +868,62 @@ impl Wizard {
             None => "Orexa Downloader will be installed on this computer. Video download support is set up automatically the first time you open it.".to_string(),
         };
         ui.add(egui::Label::new(rt(intro, 14.0, "reg", SUB)).wrap());
-        ui.add_space(14.0);
+        ui.add_space(10.0);
+
+        // Who it is installed for.
+        if let Some(e) = &self.existing {
+            let who = match e.scope {
+                Scope::AllUsers => "It is installed for all users of this computer, so updating it needs administrator permission.",
+                Scope::CurrentUser => "It is installed only for you, so updating it needs no administrator permission.",
+            };
+            ui.label(rt(who, 12.0, "reg", MUTED));
+        } else {
+            ui.label(rt("Install for", 13.0, "semibold", SUB));
+            let before = self.scope;
+            for (scope, title, note) in [
+                (Scope::CurrentUser, "Only me", "No administrator rights needed. Installs in your own user folder."),
+                (
+                    Scope::AllUsers,
+                    "All users of this computer",
+                    "Installs in Program Files. Windows asks for administrator permission.",
+                ),
+            ] {
+                let sel = self.scope == scope;
+                let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                ui.painter().rect_filled(r, 10.0, if sel { AQUA.gamma_multiply(0.14) } else { Color32::WHITE });
+                ui.painter().rect_stroke(r, 10.0, Stroke::new(if sel { 1.5 } else { 1.0 }, if sel { AQUA } else { Color32::from_rgb(0xCB, 0xD5, 0xE1) }));
+                let c = pos2(r.left() + 22.0, r.center().y);
+                ui.painter().circle_stroke(c, 8.0, Stroke::new(1.5, if sel { AQUA } else { MUTED }));
+                if sel {
+                    ui.painter().circle_filled(c, 4.5, AQUA);
+                }
+                ui.painter().text(
+                    pos2(r.left() + 42.0, r.top() + 14.0),
+                    Align2::LEFT_CENTER,
+                    title,
+                    FontId::new(14.0, FontFamily::Name("semibold".into())),
+                    NAVY,
+                );
+                ui.painter().text(
+                    pos2(r.left() + 42.0, r.top() + 31.0),
+                    Align2::LEFT_CENTER,
+                    note,
+                    FontId::new(12.0, FontFamily::Proportional),
+                    MUTED,
+                );
+                if resp.clicked() {
+                    self.scope = scope;
+                }
+            }
+            if self.scope != before && !self.dir_custom {
+                self.dir = default_dir_for(self.scope).display().to_string();
+            }
+            self.elevate_failed = self.elevate_failed && self.scope == Scope::AllUsers;
+        }
+        ui.add_space(8.0);
 
         ui.label(rt("Install location", 13.0, "semibold", SUB));
         ui.horizontal(|ui| {
@@ -746,23 +944,39 @@ impl Wizard {
                         .map(|n| n.to_string_lossy().contains("Orexa"))
                         .unwrap_or(false);
                     self.dir = if named { p } else { p.join("Orexa Downloader") }.display().to_string();
+                    self.dir_custom = true;
                 }
             }
         });
         if updating {
             ui.label(rt("The existing install location is kept.", 12.0, "reg", MUTED));
         }
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         ui.checkbox(&mut self.desktop, rt("Show Orexa Downloader on the Desktop", 14.0, "reg", NAVY));
-        ui.add_space(2.0);
         ui.label(rt("Needs about 40 MB of disk space.", 12.0, "reg", MUTED));
+        if self.elevate_failed {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(rt(
+                    "Administrator permission was not given. Choose Only me, which needs none.",
+                    12.5,
+                    "reg",
+                    BAD,
+                ))
+                .wrap(),
+            );
+        }
 
         ui.with_layout(Layout::bottom_up(Align::Max), |ui| {
             ui.horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let ready = !self.dir.trim().is_empty();
                     if button(ui, if updating { "Update" } else { "Install" }, true, ready).clicked() {
-                        self.start_install();
+                        if self.scope == Scope::AllUsers && !is_elevated() && !self.test {
+                            self.elevate_for_install(ui.ctx());
+                        } else {
+                            self.start_install();
+                        }
                     }
                     ui.add_space(4.0);
                     if button(ui, "Cancel", false, true).clicked() {
@@ -903,26 +1117,50 @@ fn main() {
     let shot = value("--screenshot");
     let preview = value("--preview");
 
-    // Program Files needs administrator rights; ask Windows once, then carry on.
-    if !test && shot.is_none() && !is_elevated() {
-        let _ = relaunch_elevated(&args);
-        return;
+    let scope_arg = if flag("--all-users") {
+        Some(Scope::AllUsers)
+    } else if flag("--current-user") {
+        Some(Scope::CurrentUser)
+    } else {
+        None
+    };
+    let auto_install = flag("--auto-install");
+    let here = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(default_dir);
+
+    // Only an all-users install, or removing one, needs administrator rights. Everything else
+    // runs as the normal user, so a computer without administrator access can still install.
+    let real = !test && shot.is_none();
+    if real && !is_elevated() {
+        let need = needs_admin(
+            uninstall_mode,
+            silent,
+            scope_arg,
+            find_existing().map(|e| e.scope),
+            uninstall_mode && dir_needs_admin(&here),
+        );
+        if need {
+            let _ = relaunch_elevated(&args);
+            return;
+        }
     }
 
     if silent && uninstall_mode {
-        let here = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-            .unwrap_or_else(default_dir);
         uninstall(&here, flag("--purge"), test);
         return;
     }
 
     if silent && !uninstall_mode {
+        let existing = find_existing();
+        let scope = scope_arg
+            .or_else(|| existing.as_ref().map(|e| e.scope))
+            .unwrap_or(Scope::AllUsers);
         let dir = dir_arg
-            .or_else(|| find_existing().map(|e| e.dir))
-            .unwrap_or_else(default_dir);
-        let opts = InstallOpts { dir, desktop: !flag("--no-desktop"), test };
+            .or_else(|| existing.map(|e| e.dir))
+            .unwrap_or_else(|| default_dir_for(scope));
+        let opts = InstallOpts { dir, scope, desktop: !flag("--no-desktop"), test };
         // --launch: open Orexa again when done (used by the in-app updater), even if the
         // install failed, so the person is never left without the app.
         let app = opts.dir.join("orexa-downloader.exe");
@@ -950,7 +1188,7 @@ fn main() {
     let options = eframe::NativeOptions {
         centered: true,
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([560.0, 440.0])
+            .with_inner_size([560.0, 540.0])
             .with_resizable(false)
             .with_maximize_button(false)
             .with_icon(window_icon())
@@ -960,6 +1198,45 @@ fn main() {
     let _ = eframe::run_native(
         "Orexa Downloader Setup",
         options,
-        Box::new(move |cc| Ok(Box::new(Wizard::new(cc, uninstall_mode, dir_arg, test, shot, preview)))),
+        Box::new(move |cc| Ok(Box::new(Wizard::new(cc, uninstall_mode, dir_arg, scope_arg, auto_install, test, shot, preview)))),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_per_user_install_never_asks_for_administrator_rights() {
+        // wizard: asks only when "All users" is chosen
+        assert!(!needs_admin(false, false, None, None, false));
+        // silent, told to install for the current user
+        assert!(!needs_admin(false, true, Some(Scope::CurrentUser), None, false));
+        // silent update of an existing per-user copy (what the in-app updater does)
+        assert!(!needs_admin(false, true, None, Some(Scope::CurrentUser), false));
+        // removing a per-user copy
+        assert!(!needs_admin(true, true, None, Some(Scope::CurrentUser), false));
+    }
+
+    #[test]
+    fn an_all_users_install_asks_for_administrator_rights() {
+        assert!(needs_admin(false, true, Some(Scope::AllUsers), None, false));
+        assert!(needs_admin(false, true, None, Some(Scope::AllUsers), false));
+        // a scripted install with no choice stays all-users, as before
+        assert!(needs_admin(false, true, None, None, true));
+        assert!(needs_admin(true, true, None, Some(Scope::AllUsers), true));
+    }
+
+    #[test]
+    fn each_scope_has_its_own_place() {
+        let user = default_dir_for(Scope::CurrentUser).to_string_lossy().to_lowercase();
+        let all = default_dir_for(Scope::AllUsers).to_string_lossy().to_lowercase();
+        assert!(user.contains("programs") && user.ends_with("orexa downloader"));
+        assert!(all.ends_with("orexa downloader") && !user.starts_with(&all));
+        assert_ne!(Scope::AllUsers.key(), Scope::CurrentUser.key());
+        assert!(Scope::AllUsers.key().starts_with("HKLM"));
+        assert!(Scope::CurrentUser.key().starts_with("HKCU"));
+        assert_eq!(Scope::CurrentUser.shortcut_folders(), ("Desktop", "Programs"));
+        assert_eq!(Scope::AllUsers.shortcut_folders(), ("CommonDesktopDirectory", "CommonPrograms"));
+    }
 }

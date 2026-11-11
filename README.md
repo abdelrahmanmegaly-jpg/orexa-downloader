@@ -56,8 +56,9 @@ video, or open a magnet link, Orexa takes it over, downloads it faster, and keep
 ## Install
 
 1. **[Download `Orexa-Downloader-Setup.exe`](https://github.com/abdelrahmanmegaly-jpg/orexa-downloader/releases/latest/download/Orexa-Downloader-Setup.exe)**
-   and run it. Anyone can download it; no account is needed. It installs to Program Files and can add a
-   desktop shortcut. Running a newer setup on a PC that already has Orexa updates it in place, keeping
+   and run it. Anyone can download it; no account is needed. You choose **Only me** (no administrator rights
+   needed, installs in your user folder) or **All users** (Program Files, Windows asks for administrator
+   permission), and it can add a desktop shortcut. Running a newer setup on a PC that already has Orexa updates it in place, keeping
    your downloads and settings.
 2. **Add the browser extension** from the official
    [Chrome Web Store](https://chromewebstore.google.com/detail/lhlfkhkcodflljkapdcpcecapmncjfeh)
