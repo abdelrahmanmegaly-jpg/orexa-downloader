@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.0
+
+The browser extension is unchanged (still 0.1.7); this update is for the app.
+
+### Added
+- **YouTube playlists.** Paste a playlist link, or a video link that includes `&list=`, into **Add URL**. Orexa lists every video with its length. Tick the ones you want, or use **All** / **None**, then pick a quality: **Best (up to 1080p)**, **720p**, **480p** or **Audio only**. Each video downloads on its own, a few at a time, into a folder named after the playlist. File names are numbered (`001 - …`) so they stay in playlist order. Private and deleted videos are skipped.
+- **Only this video.** If you open a single video that belongs to a playlist, one click downloads just that video.
+
+### Improved
+- **YouTube downloads retry by themselves.** When YouTube sends an empty or broken stream ("The downloaded file is empty"), Orexa tries again up to three times before showing an error.
+
+### Fixed
+- Nothing else in this release.
+
+### Removed
+- Nothing in this release.
+
 ## 0.1.9 (extension 0.1.7)
 
 ### Added

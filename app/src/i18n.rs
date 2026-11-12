@@ -161,6 +161,9 @@ fn fill_template(s: &str, en: &str, tr: &str, table: &[(&str, &str)], depth: u8)
 }
 
 const AR_TEMPLATES: &[(&str, &str)] = &[
+    ("Download {} videos", "تنزيل {1} فيديوهات"),
+    ("{}, {} videos, {}", "{1}، {2} فيديوهات، {3}"),
+    ("{} videos, {}", "{1} فيديوهات، {2}"),
     ("The site refused the download ({}). The link may have expired or need you to be signed in: start it again from the browser.", "رفض الموقع التنزيل ({1}). ربما انتهت صلاحية الرابط أو يلزم تسجيل الدخول: ابدأه مجددًا من المتصفح."),
     ("The file is no longer there ({})", "الملف لم يعد موجودًا ({1})"),
     ("Version {} is ready. You have {}.", "الإصدار {1} جاهز. لديك {2}."),
@@ -343,6 +346,13 @@ fn ar_exact(s: &str) -> Option<&'static str> {
         "The site only lets the browser download this. Start it again from the browser, or update the Orexa extension so it can take over by itself." => {
             "يسمح الموقع للمتصفح فقط بتنزيل هذا الملف. ابدأه مجددًا من المتصفح، أو حدّث إضافة Orexa لتتولى ذلك تلقائيًا."
         }
+        "Download 1 video" => "تنزيل فيديو واحد",
+        "Only this video" => "هذا الفيديو فقط",
+        "Best, up to 1080p" => "الأفضل حتى 1080p",
+        "Each video downloads at this quality, or the best below it." => "يُنزَّل كل فيديو بهذه الجودة أو بأفضل جودة أقل منها.",
+        "Save in a folder named after the playlist" => "احفظ في مجلد باسم قائمة التشغيل",
+        "This playlist has no videos that can be downloaded" => "لا توجد في قائمة التشغيل هذه فيديوهات يمكن تنزيلها",
+        "The videos download a few at a time, as set in Settings." => "تُنزَّل الفيديوهات بضعة في كل مرة، حسب الإعدادات.",
         "Library" => "المكتبة",
         "Categories" => "الفئات",
         "Settings" => "الإعدادات",

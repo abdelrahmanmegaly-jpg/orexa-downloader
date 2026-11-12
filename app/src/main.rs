@@ -1758,14 +1758,30 @@ fn modal(ctx: &egui::Context, p: &Pal, id: &str, width: f32, typical_height: f32
 
 /// A list of a torrent's files with a checkbox each, "All" / "None", and the total chosen.
 fn torrent_file_list(ui: &mut Ui, p: &Pal, files: &[(String, u64)], sel: &mut Vec<bool>, id: &str, max_h: f32) {
+    pick_list(ui, p, "Files", files, sel, id, max_h, fmt_size);
+}
+
+/// A list with a tick box per item, "All" / "None", and how much is chosen. `show` turns an
+/// item's number into text (a size for files, a length for videos).
+#[allow(clippy::too_many_arguments)]
+fn pick_list(
+    ui: &mut Ui,
+    p: &Pal,
+    label: &str,
+    files: &[(String, u64)],
+    sel: &mut Vec<bool>,
+    id: &str,
+    max_h: f32,
+    show: fn(u64) -> String,
+) {
     if sel.len() != files.len() {
         *sel = vec![true; files.len()];
     }
     let picked = sel.iter().filter(|b| **b).count();
     let picked_size: u64 = files.iter().zip(sel.iter()).filter(|(_, b)| **b).map(|(f, _)| f.1).sum();
     hrow(ui, |ui| {
-        lbl(ui, "Files", fs(13.0), p.sub);
-        lbl(ui, format!("{} of {} chosen, {}", picked, files.len(), fmt_size(picked_size)), f(13.0), p.muted);
+        lbl(ui, label, fs(13.0), p.sub);
+        lbl(ui, format!("{} of {} chosen, {}", picked, files.len(), show(picked_size)), f(13.0), p.muted);
         ui.with_layout(rl_layout(Align::Center), |ui| {
             if button(ui, p, "None", None, Kind::Secondary, 28.0, true).clicked() {
                 sel.iter_mut().for_each(|b| *b = false);
@@ -1793,7 +1809,7 @@ fn torrent_file_list(ui: &mut Ui, p: &Pal, files: &[(String, u64)], sel: &mut Ve
                         let gy = g.size().y / 2.0;
                         ui.painter().galley_m(r, r.left_center() - vec2(0.0, gy), g, p.text);
                         ui.with_layout(rl_layout(Align::Center), |ui| {
-                            lbl(ui, fmt_size(*size), f(12.0), p.muted);
+                            lbl(ui, show(*size), f(12.0), p.muted);
                         });
                     });
                 }
@@ -2041,6 +2057,8 @@ enum ProbeState {
     YtReady(Box<YtInfo>),
     /// A torrent whose files have been read.
     Torrent(Box<torrent::TorrentMeta>),
+    /// A YouTube playlist whose videos have been read.
+    Playlist(Box<youtube::Playlist>),
     /// A YouTube link while yt-dlp is not installed yet.
     NeedsSetup,
     Failed(String),
@@ -2050,7 +2068,12 @@ enum ProbeOk {
     Http(u64, Option<String>),
     Yt(Box<YtInfo>),
     Torrent(Box<torrent::TorrentMeta>),
+    Playlist(Box<youtube::Playlist>),
 }
+
+/// The quality offered for a whole playlist: (label, highest picture, sound only).
+const PLAYLIST_QUALITY: [(&str, u32, bool); 4] =
+    [("Best, up to 1080p", 1080, false), ("720p", 720, false), ("480p", 480, false), ("Audio only", 0, true)];
 
 type ProbeResult = (String, Result<ProbeOk, String>);
 
@@ -2183,6 +2206,9 @@ struct NewDownloadDialog {
     save_dir_auto: bool,
     /// A torrent: which of its files are ticked.
     torrent_sel: Vec<bool>,
+    /// A playlist: which videos are ticked, and whether they go in a folder of their own.
+    playlist_sel: Vec<bool>,
+    playlist_folder: bool,
 }
 
 impl Default for NewDownloadDialog {
@@ -2199,6 +2225,8 @@ impl Default for NewDownloadDialog {
             yt_sel: 0,
             save_dir_auto: true,
             torrent_sel: Vec::new(),
+            playlist_sel: Vec::new(),
+            playlist_folder: true,
             extra: Extra::default(),
         }
     }
@@ -2499,9 +2527,10 @@ impl App {
         match o.open.as_deref() {
             Some("add") => {
                 app.open_add();
-                // Developer shortcut: fill an example link unless one was already picked up
-                // from the clipboard.
-                if app.dialog.url.is_empty() {
+                // Developer shortcut: a link given with --url always wins; otherwise an example
+                // link, unless one was already picked up from the clipboard.
+                if o.url.is_some() || app.dialog.url.is_empty() {
+                    app.prefilled = None;
                     app.dialog.url = o
                         .url
                         .clone()
@@ -3013,6 +3042,12 @@ impl App {
                     self.dialog.file_name = format!("{}.mp4", title.trim_end_matches(['.', ' ']));
                     self.dialog.probe = ProbeState::YtReady(info);
                 }
+                Ok(ProbeOk::Playlist(pl)) => {
+                    self.dialog.playlist_sel = vec![true; pl.entries.len()];
+                    self.dialog.yt_sel = 0;
+                    self.dialog.file_name = clean_name(&pl.title);
+                    self.dialog.probe = ProbeState::Playlist(pl);
+                }
                 Ok(ProbeOk::Torrent(meta)) => {
                     self.dialog.torrent_sel = vec![true; meta.files.len()];
                     self.dialog.file_name = meta.name.clone();
@@ -3037,7 +3072,13 @@ impl App {
                         self.dialog.probe = ProbeState::Checking;
                         let tx = self.probe_tx.clone();
                         thread::spawn(move || {
-                            let r = youtube::probe_youtube(&url).map(|i| ProbeOk::Yt(Box::new(i)));
+                            // A playlist link reads the whole list; "Only this video" turns it
+                            // back into a single-video link.
+                            let r = if youtube::playlist_id(&url).is_some() {
+                                youtube::probe_playlist(&url).map(|p| ProbeOk::Playlist(Box::new(p)))
+                            } else {
+                                youtube::probe_youtube(&url).map(|i| ProbeOk::Yt(Box::new(i)))
+                            };
                             let _ = tx.send((url, r));
                         });
                     } else if torrent::is_torrent_link(&url, "") {
@@ -3067,7 +3108,9 @@ impl App {
         if !self.url_ok() {
             return false;
         }
-        if youtube::uses_ytdlp(self.dialog.url.trim()) {
+        if let ProbeState::Playlist(_) = &self.dialog.probe {
+            self.dialog.playlist_sel.iter().any(|b| *b)
+        } else if youtube::uses_ytdlp(self.dialog.url.trim()) {
             matches!(self.dialog.probe, ProbeState::YtReady(_))
         } else if let ProbeState::Torrent(meta) = &self.dialog.probe {
             // At least one file must be ticked.
@@ -3084,6 +3127,11 @@ impl App {
 
     fn add_download(&mut self, start_now: bool) {
         if !self.can_submit() {
+            return;
+        }
+        if let ProbeState::Playlist(pl) = self.dialog.probe.clone() {
+            self.add_playlist(&pl);
+            let _ = start_now; // the queue starts them, as many at a time as the settings allow
             return;
         }
         let url = self.dialog.url.trim().to_string();
@@ -3145,6 +3193,56 @@ impl App {
             self.engine.start(d.clone());
         }
         self.downloads.push(d);
+        self.dialog.open = false;
+        self.dialog.url.clear();
+        self.dialog.file_name.clear();
+        self.dialog.probe = ProbeState::Idle;
+        self.dialog.last_edit = None;
+    }
+
+    /// Every ticked video of a playlist becomes a download of its own, numbered in playlist
+    /// order, in a folder named after the playlist (unless that was switched off).
+    fn add_playlist(&mut self, pl: &youtube::Playlist) {
+        let (_, height, audio) = PLAYLIST_QUALITY[self.dialog.yt_sel.min(PLAYLIST_QUALITY.len() - 1)];
+        let mut dir = PathBuf::from(self.dialog.save_dir.trim());
+        if self.dialog.playlist_folder {
+            let name = clean_name(&pl.title);
+            let name = name.trim_end_matches(['.', ' ']);
+            dir = dir.join(if name.is_empty() { "YouTube playlist" } else { name });
+        }
+        let digits = pl.entries.len().to_string().len().max(2);
+        let ext = if audio { "m4a" } else { "mp4" };
+        let added = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        for (i, e) in pl.entries.iter().enumerate() {
+            if !self.dialog.playlist_sel.get(i).copied().unwrap_or(true) {
+                continue;
+            }
+            let title: String = clean_name(&e.title).chars().take(110).collect();
+            let file_name = format!("{:0w$} - {}.{}", i + 1, title.trim_end_matches(['.', ' ']), ext, w = digits);
+            let mut d = Download {
+                id: self.next_id,
+                url: format!("https://www.youtube.com/watch?v={}", e.id),
+                file_name: file_name.clone(),
+                ext: ext.to_string(),
+                size: 0,
+                downloaded: 0,
+                // Queued: started a few at a time, as the settings allow.
+                status: Status::Queued,
+                speed_bps: 0.0,
+                save_dir: dir.to_string_lossy().into_owned(),
+                added: added.clone(),
+                error: None,
+                source: Source::YouTube(YtOpts { id: e.id.clone(), height, audio }),
+                thumb: None,
+                files: None,
+                seeding: None,
+                live: Default::default(),
+                extra: Extra::default(),
+            };
+            self.next_id += 1;
+            self.make_name_unique(&mut d);
+            self.downloads.push(d);
+        }
         self.dialog.open = false;
         self.dialog.url.clear();
         self.dialog.file_name.clear();
@@ -4320,6 +4418,70 @@ impl App {
                             }
                         };
                         match dlg.probe.clone() {
+                            ProbeState::Playlist(pl) => {
+                                hrow(ui, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 12.0;
+                                    let (t, _) = ui.allocate_exact_size(vec2(54.0, 54.0), Sense::hover());
+                                    ui.painter().rect_filled(t, 10.0, p.accent_soft);
+                                    paint_icon(ui, Rect::from_center_size(t.center(), vec2(24.0, 24.0)), "list", p.accent_ink);
+                                    col(ui, |ui| {
+                                        ui.spacing_mut().item_spacing.y = 2.0;
+                                        lbl(ui, trunc_str(&pl.title, 60), fs(14.0), p.text);
+                                        let total: u64 = pl.entries.iter().map(|e| e.duration).sum();
+                                        let n = pl.entries.len();
+                                        let who = if pl.channel.is_empty() {
+                                            format!("{} videos, {}", n, youtube::fmt_clock(total))
+                                        } else {
+                                            format!("{}, {} videos, {}", pl.channel, n, youtube::fmt_clock(total))
+                                        };
+                                        lbl(ui, who, f(13.0), p.muted);
+                                        // A link to one video inside a playlist: that video alone is one click away.
+                                        if let Some(vid) = youtube::video_id(&dlg.url) {
+                                            ui.add_space(4.0);
+                                            if button(ui, p, "Only this video", Some("film"), Kind::Secondary, 30.0, true).clicked() {
+                                                dlg.url = format!("https://www.youtube.com/watch?v={}", vid);
+                                                dlg.probe = ProbeState::Idle;
+                                                dlg.last_edit = Some(Instant::now() - Duration::from_secs(1));
+                                            }
+                                        }
+                                    });
+                                });
+                                ui.add_space(6.0);
+                                dlg.yt_sel = dlg.yt_sel.min(PLAYLIST_QUALITY.len() - 1);
+                                lbl(ui, "Quality", fs(13.0), p.sub);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+                                    for (i, (label, _, _)) in PLAYLIST_QUALITY.iter().enumerate() {
+                                        let w = text_w(ui, label, fs(13.0)) + 28.0;
+                                        let (r, resp) = ui.allocate_exact_size(vec2(w, 34.0), Sense::click());
+                                        let sel = dlg.yt_sel == i;
+                                        if resp.hovered() {
+                                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                        }
+                                        ui.painter().rect_filled(
+                                            r,
+                                            8.0,
+                                            if sel { p.accent_soft } else if resp.hovered() { p.tile } else { p.surface },
+                                        );
+                                        ui.painter().rect_stroke(r, 8.0, Stroke::new(1.0, if sel { p.accent } else { p.border_strong }));
+                                        ui.painter().txt(
+                                            r.center(),
+                                            Align2::CENTER_CENTER,
+                                            *label,
+                                            if sel { fs(13.0) } else { f(13.0) },
+                                            if sel { p.accent_ink } else { p.text },
+                                        );
+                                        if resp.clicked() {
+                                            dlg.yt_sel = i;
+                                        }
+                                    }
+                                });
+                                ui.add_space(6.0);
+                                let entries: Vec<(String, u64)> = pl.entries.iter().map(|e| (e.title.clone(), e.duration)).collect();
+                                pick_list(ui, p, "Videos", &entries, &mut dlg.playlist_sel, "playlist_videos", (ui.ctx().screen_rect().height() - 760.0).clamp(96.0, 260.0), youtube::fmt_clock);
+                                ui.add_space(6.0);
+                                ui.checkbox(&mut dlg.playlist_folder, rt("Save in a folder named after the playlist", f(13.0), p.text));
+                            }
                             ProbeState::YtReady(info) => {
                                 hrow(ui, |ui| {
                                     ui.spacing_mut().item_spacing.x = 12.0;
@@ -4500,7 +4662,7 @@ impl App {
                                     ("Use http or https", p.bad, p.bad.gamma_multiply(0.14))
                                 } else {
                                     match &dlg.probe {
-                                        ProbeState::Ready(..) | ProbeState::Torrent(_) => ("Link is ready", p.ok, p.ok_soft),
+                                        ProbeState::Ready(..) | ProbeState::Torrent(_) | ProbeState::Playlist(_) => ("Link is ready", p.ok, p.ok_soft),
                                         ProbeState::Failed(_) if is_torrent_now => ("Starts anyway", p.sub, p.track),
                                         ProbeState::Failed(msg) => {
                                             let blocked = ["401", "403", "404", "410"].iter().any(|c| msg.contains(c));
@@ -4595,7 +4757,11 @@ impl App {
             });
             marks.push(("after_save", ui.cursor().top()));
             ui.add_space(18.0);
-            if busy {
+            let is_playlist = matches!(dlg.probe, ProbeState::Playlist(_));
+            if is_playlist {
+                // The videos join the queue and start a few at a time.
+                lbl(ui, "The videos download a few at a time, as set in Settings.", f(13.0), p.muted);
+            } else if busy {
                 // Something is already downloading: let the user choose.
                 lbl(ui,
                     "A download is running. Add this one to the queue to start after it, or download it now.",
@@ -4618,8 +4784,15 @@ impl App {
             ui.add_space(24.0);
             // Fixed-height footer so the dialog shrinks back when content goes away.
             let w = ui.available_width();
+            // A playlist: say how many videos the button adds.
+            let picked_videos = if let ProbeState::Playlist(_) = &dlg.probe { Some(dlg.playlist_sel.iter().filter(|b| **b).count()) } else { None };
             ui.allocate_ui_with_layout(vec2(w, 44.0), rl_layout(Align::Center), |ui| {
-                if busy {
+                if let Some(n) = picked_videos {
+                    let label = if n == 1 { "Download 1 video".to_string() } else { format!("Download {} videos", n) };
+                    if button(ui, p, &label, Some("download"), Kind::Primary, 44.0, ok).clicked() {
+                        submit = true;
+                    }
+                } else if busy {
                     if button(ui, p, "Download now", Some("download"), Kind::Primary, 44.0, ok).clicked() {
                         submit = true;
                     }

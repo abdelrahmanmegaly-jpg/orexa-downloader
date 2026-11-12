@@ -91,6 +91,7 @@ pub fn is_youtube(url: &str) -> bool {
     }
     let yt = host == "youtube.com" || host.ends_with(".youtube.com") || host == "youtube-nocookie.com";
     yt && (path.starts_with("/watch")
+        || (path.starts_with("/playlist") && path.contains("list="))
         || path.starts_with("/shorts/")
         || path.starts_with("/live/")
         || path.starts_with("/embed/")
@@ -453,6 +454,91 @@ fn last_error_line(text: &str) -> String {
 }
 
 /// The 11-character video id in a YouTube link (watch, youtu.be, shorts, live, embed).
+/// A YouTube playlist in the link (`list=`), if there is one.
+pub fn playlist_id(url: &str) -> Option<String> {
+    if !is_youtube(url) {
+        return None;
+    }
+    let q = url.trim().split_once('?')?.1;
+    q.split(['&', '#'])
+        .find_map(|part| part.strip_prefix("list="))
+        .map(|v| v.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect::<String>())
+        .filter(|id| id.len() >= 2)
+}
+
+/// One video of a playlist.
+#[derive(Clone, PartialEq, Debug)]
+pub struct PlEntry {
+    pub id: String,
+    pub title: String,
+    pub duration: u64,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Playlist {
+    pub id: String,
+    pub title: String,
+    pub channel: String,
+    pub entries: Vec<PlEntry>,
+}
+
+/// Read a playlist's videos (titles and lengths only, which is quick even for long lists).
+pub fn probe_playlist(url: &str) -> Result<Playlist, String> {
+    let id = playlist_id(url).ok_or("Not a playlist link")?;
+    let page = format!("https://www.youtube.com/playlist?list={}", id);
+    match playlist_inner(&page, false) {
+        // Private or unlisted lists need the browser's sign-in.
+        Err(e) if cookies_path().exists() && (needs_signin(&e) || e.to_lowercase().contains("does not exist")) => {
+            playlist_inner(&page, true)
+        }
+        other => other,
+    }
+}
+
+fn playlist_inner(page: &str, use_cookies: bool) -> Result<Playlist, String> {
+    let exe = ytdlp_path().ok_or("yt-dlp is not installed")?;
+    let cookies = if use_cookies { CookieCopy::new() } else { CookieCopy::none() };
+    let mut cmd = hidden(&exe);
+    cmd.args(["--flat-playlist", "--yes-playlist", "--dump-single-json", "--no-warnings", "--encoding", "utf-8"]);
+    if let Some(p) = cookies.path() {
+        cmd.arg("--cookies").arg(p);
+    }
+    let out = cmd.arg(page).stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(last_error_line(&String::from_utf8_lossy(&out.stderr)));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    parse_playlist(&v)
+}
+
+pub fn parse_playlist(v: &Value) -> Result<Playlist, String> {
+    let entries: Vec<PlEntry> = v["entries"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    let id = e["id"].as_str()?.to_string();
+                    let title = e["title"].as_str().unwrap_or("").to_string();
+                    // Videos that are gone or private cannot be downloaded.
+                    if id.len() != 11 || title == "[Private video]" || title == "[Deleted video]" {
+                        return None;
+                    }
+                    Some(PlEntry { id, title, duration: e["duration"].as_f64().unwrap_or(0.0) as u64 })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if entries.is_empty() {
+        return Err("This playlist has no videos that can be downloaded".into());
+    }
+    Ok(Playlist {
+        id: v["id"].as_str().unwrap_or("").to_string(),
+        title: v["title"].as_str().unwrap_or("YouTube playlist").to_string(),
+        channel: v["channel"].as_str().or_else(|| v["uploader"].as_str()).unwrap_or("").to_string(),
+        entries,
+    })
+}
+
 pub fn video_id(url: &str) -> Option<String> {
     let ok = |t: &str| -> Option<String> {
         let t: String = t.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
@@ -782,6 +868,26 @@ fn run_once(
     }
 }
 
+/// A failure that usually goes away on a second try (a broken or empty stream, a dropped
+/// connection), as opposed to one that will fail again (private video, no such format).
+fn is_transient(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    [
+        "downloaded file is empty",
+        "http error 5",
+        "http error 403",
+        "timed out",
+        "connection reset",
+        "connection aborted",
+        "incomplete read",
+        "fragment",
+        "unable to download video data",
+        "giving up after",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
+}
+
 pub fn yt_worker(d: Download, o: YtOpts, cmd_rx: Receiver<WorkerCmd>, ev_tx: Sender<EngineEvent>) {
     let id = d.id;
     let _ = ev_tx.send(EngineEvent::State(id, Status::Downloading, None));
@@ -799,6 +905,9 @@ pub fn yt_worker(d: Download, o: YtOpts, cmd_rx: Receiver<WorkerCmd>, ev_tx: Sen
     let mut last_reported = 0u64;
     // Without cookies first (faster and more reliable); with them if YouTube asks to sign in.
     let mut use_cookies = false;
+    // YouTube sometimes sends an empty or broken stream, more so with several downloads at
+    // once; a fresh try a moment later usually works.
+    let mut retries = 0u32;
 
     loop {
         match run_once(&d, &o, &exe, &dir, &stem, &cmd_rx, &ev_tx, &mut last_reported, use_cookies) {
@@ -834,6 +943,31 @@ pub fn yt_worker(d: Download, o: YtOpts, cmd_rx: Receiver<WorkerCmd>, ev_tx: Sen
                     use_cookies = true;
                     continue;
                 }
+                if retries < 3 && is_transient(&e) {
+                    retries += 1;
+                    let _ = ev_tx.send(EngineEvent::Log(id, format!("{} Trying again ({} of 3)", e, retries)));
+                    // Wait, but stay responsive to Pause / Stop.
+                    match cmd_rx.recv_timeout(Duration::from_secs(3 * retries as u64)) {
+                        Ok(WorkerCmd::Stop) => {
+                            let _ = ev_tx.send(EngineEvent::State(id, Status::Queued, None));
+                            return;
+                        }
+                        Ok(WorkerCmd::Pause) => {
+                            let _ = ev_tx.send(EngineEvent::State(id, Status::Paused, None));
+                            match cmd_rx.recv() {
+                                Ok(WorkerCmd::Run) => {
+                                    let _ = ev_tx.send(EngineEvent::State(id, Status::Downloading, None));
+                                }
+                                _ => {
+                                    let _ = ev_tx.send(EngineEvent::State(id, Status::Queued, None));
+                                    return;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 let _ = ev_tx.send(EngineEvent::State(id, Status::Error, Some(e)));
                 return;
             }
@@ -863,6 +997,15 @@ pub fn yt_worker(d: Download, o: YtOpts, cmd_rx: Receiver<WorkerCmd>, ev_tx: Sen
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn passing_failures_are_tried_again_but_lasting_ones_are_not() {
+        use super::is_transient as t;
+        assert!(t("The downloaded file is empty"));
+        assert!(t("unable to download video data: HTTP Error 503: Service Unavailable"));
+        assert!(!t("Private video. Sign in if you've been granted access to this video"));
+        assert!(!t("Requested format is not available"));
+    }
+
     #[test]
     fn odd_heights_get_the_usual_names() {
         use super::nominal_height as n;
@@ -947,7 +1090,6 @@ mod tests {
             "https://example.com/file.zip",
             "https://www.youtube.com/",
             "https://www.youtube.com/@somechannel",
-            "https://www.youtube.com/playlist?list=PL123",
             "https://notyoutube.com/watch?v=abc",
             "https://youtube.com.evil.example/watch?v=abc",
             "https://youtu.be/",
@@ -969,5 +1111,40 @@ mod tests {
     fn clock_format() {
         assert_eq!(fmt_clock(75), "1:15");
         assert_eq!(fmt_clock(3725), "1:02:05");
+    }
+}
+
+#[cfg(test)]
+mod playlist_tests {
+    use super::*;
+
+    #[test]
+    fn playlist_links_are_recognised() {
+        let id = "PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf";
+        assert_eq!(playlist_id(&format!("https://www.youtube.com/playlist?list={}", id)).as_deref(), Some(id));
+        assert_eq!(playlist_id(&format!("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list={}&index=3", id)).as_deref(), Some(id));
+        assert_eq!(playlist_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), None);
+        assert_eq!(playlist_id(&format!("https://example.com/watch?list={}", id)), None);
+        assert!(is_youtube(&format!("https://www.youtube.com/playlist?list={}", id)));
+        assert!(!is_youtube("https://www.youtube.com/playlist"));
+    }
+
+    #[test]
+    fn a_playlist_is_read_without_private_or_deleted_videos() {
+        let v: Value = serde_json::from_str(
+            r#"{"id":"PL1","title":"Lessons","channel":"Teacher","entries":[
+                {"id":"aaaaaaaaaaa","title":"One","duration":61.0},
+                {"id":"bbbbbbbbbbb","title":"[Private video]","duration":null},
+                {"id":"ccccccccccc","title":"Two","duration":125.5},
+                {"id":"ddddddddddd","title":"[Deleted video]"}]}"#,
+        )
+        .unwrap();
+        let p = parse_playlist(&v).unwrap();
+        assert_eq!(p.title, "Lessons");
+        assert_eq!(p.channel, "Teacher");
+        assert_eq!(p.entries.iter().map(|e| e.title.as_str()).collect::<Vec<_>>(), ["One", "Two"]);
+        assert_eq!(p.entries[1].duration, 125);
+        let empty: Value = serde_json::from_str(r#"{"id":"PL2","entries":[]}"#).unwrap();
+        assert!(parse_playlist(&empty).is_err());
     }
 }
