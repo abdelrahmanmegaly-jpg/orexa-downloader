@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.1 (extension 0.2.1)
+
+The extension's version number moves to 0.2.1 to match the app; the extension itself has no changes in this release.
+
+### Added
+- **Change link.** An unfinished download can continue from another address, like a mirror or a fresh link from the website. Press **Change** next to the link in the download's details and paste the new one. Orexa checks it is the same file, then continues from what is already saved.
+- **Same file, new link.** When you add a file you already have from another link, Orexa tells you. An unfinished copy can be continued with **Continue it** instead of starting over. A download from your browser continues the unfinished copy by itself.
+- **Check file.** Compare a finished file with the checksum on its download page (SHA-256, SHA-512, SHA-1 or MD5) to be sure it is complete and unchanged. Orexa also looks for the checksum on the server by itself.
+- **Speed limit.** In Settings, keep all downloads together under a speed you choose, in KB/s or MB/s. It applies to files, YouTube and torrents.
+- **Scheduled downloads.** In Settings, queued downloads wait for a start time, for example at night, and can stop at a set time. Orexa has to be running; the tray is enough.
+- **Leftovers.** Removing an unfinished download can move its partial file to the Recycle Bin. In Settings, **Look for leftovers** finds partial files of downloads that are no longer in your list.
+
+### Improved
+- **Downloads survive a server going down.** When a server stops answering, the download shows **Server not answering** with a countdown and keeps trying for about ten minutes before it gives up. Before, it failed after a few seconds or waited forever.
+- **Connections on each row.** A running download shows how many connections it uses.
+- **The download window fits what it shows.** It grows and shrinks with its content and stays on screen, so its buttons are never hidden. When the main window is small, the details scroll.
+- **Settings text wraps beside its buttons** instead of running under them.
+
+### Fixed
+- A download that continued with one connection could end up damaged when the server sent the whole file again instead of the rest.
+- A download whose connection was cut before the end could be marked as finished.
+
+### Removed
+- Nothing in this release.
+
 ## 0.2.0
 
 The browser extension is unchanged (still 0.1.7); this update is for the app.

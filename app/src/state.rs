@@ -88,6 +88,18 @@ pub struct SavedState {
     /// What to do when every download has finished: "", "folder" or "sleep".
     #[serde(default)]
     pub after_finish: String,
+    /// Speed limit for all downloads together, in KB/s (kept while switched off).
+    #[serde(default)]
+    pub speed_limit_on: bool,
+    #[serde(default)]
+    pub speed_limit_kbs: u64,
+    /// Scheduled downloads: on/off, start and stop times ("HH:MM", stop may be empty).
+    #[serde(default)]
+    pub sched_on: bool,
+    #[serde(default)]
+    pub sched_start: String,
+    #[serde(default)]
+    pub sched_stop: String,
 }
 
 fn yes() -> bool {
@@ -232,6 +244,17 @@ impl App {
         i18n::set(self.lang);
         self.welcomed = st.welcomed;
         self.after_finish = AfterFinish::from_code(&st.after_finish);
+        self.speed_on = st.speed_limit_on;
+        if st.speed_limit_kbs > 0 {
+            self.speed_kbs = st.speed_limit_kbs;
+            self.speed_mb = self.speed_kbs % 1024 == 0;
+            self.speed_text = if self.speed_mb { (self.speed_kbs / 1024).to_string() } else { self.speed_kbs.to_string() };
+        }
+        self.sched_on = st.sched_on;
+        if schedule::parse_hm(&st.sched_start).is_some() {
+            self.sched_start = st.sched_start;
+        }
+        self.sched_stop = st.sched_stop;
         self.downloads = st.downloads.into_iter().map(|d| d.into_download()).collect();
         let top = self.downloads.iter().map(|d| d.id).max().unwrap_or(0);
         self.next_id = st.next_id.max(top + 1).max(100);
@@ -282,6 +305,11 @@ impl App {
             language: self.lang.code().to_string(),
             welcomed: self.welcomed,
             after_finish: self.after_finish.code().to_string(),
+            speed_limit_on: self.speed_on,
+            speed_limit_kbs: self.speed_kbs,
+            sched_on: self.sched_on,
+            sched_start: self.sched_start.clone(),
+            sched_stop: self.sched_stop.clone(),
         };
         let Ok(json) = serde_json::to_string_pretty(&st) else { return };
         if json == self.last_json {
@@ -354,6 +382,11 @@ mod tests {
             language: "ar".into(),
             welcomed: true,
             after_finish: "sleep".into(),
+            speed_limit_on: true,
+            speed_limit_kbs: 2048,
+            sched_on: true,
+            sched_start: "02:00".into(),
+            sched_stop: "07:00".into(),
         };
         let json = serde_json::to_string(&st).unwrap();
         let back: SavedState = serde_json::from_str(&json).unwrap();

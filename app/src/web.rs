@@ -95,6 +95,17 @@ pub fn get_tolerant(
 }
 
 /// A friendly message for a refused or failed answer.
+/// The server could not be reached or went silent (as opposed to answering "no").
+pub fn unreachable(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
+}
+
+/// Seconds to wait between tries while a server is not answering: about ten minutes in all.
+pub const PATIENT_WAITS: [u64; 10] = [5, 10, 20, 30, 60, 60, 60, 120, 120, 120];
+
+pub const NOT_ANSWERING: &str =
+    "The server stopped answering. Try again later, or use Change link to continue from another address.";
+
 pub fn status_message(status: reqwest::StatusCode) -> String {
     match status.as_u16() {
         401 | 403 => format!(

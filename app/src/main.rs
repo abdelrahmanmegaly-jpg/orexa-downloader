@@ -1,11 +1,16 @@
 // Run as a Windows GUI program so no console (CMD) window opens with the app.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod checksum;
+mod cleanup;
 mod i18n;
 mod multipart;
 mod native;
+mod relink;
 mod shell;
+mod schedule;
 mod state;
+mod throttle;
 mod torrent;
 mod update;
 mod web;
@@ -161,6 +166,8 @@ struct LiveInfo {
     hist: Vec<f32>,
     /// Timestamped events: starts, retries, pauses, failures.
     log: Vec<String>,
+    /// The server is not answering; the next try is at this moment.
+    retry_at: Option<Instant>,
 }
 
 impl LiveInfo {
@@ -468,6 +475,8 @@ enum EngineEvent {
     Conns(u64, usize),
     /// The site refused Orexa but would let the browser download it: give it back.
     HandBack(u64),
+    /// The server is not answering: the next try is in this many seconds (None = answering).
+    Waiting(u64, Option<u64>),
 }
 
 struct Engine {
@@ -551,6 +560,44 @@ fn space_problem(d: &Download) -> Option<String> {
     ))
 }
 
+/// What a wait between tries ended with.
+enum Waited {
+    Again,
+    /// Stopped (back to the queue): the worker ends.
+    Stopped,
+}
+
+/// The server is not answering: say when the next try is, then wait for it. Pause holds the
+/// wait until Resume; Stop ends it.
+fn wait_for_server(d: &Download, secs: u64, cmd_rx: &Receiver<WorkerCmd>, ev_tx: &Sender<EngineEvent>) -> Waited {
+    let _ = ev_tx.send(EngineEvent::Waiting(d.id, Some(secs)));
+    let _ = ev_tx.send(EngineEvent::Log(d.id, format!("The server is not answering, trying again in {} s", secs)));
+    let end = Instant::now() + Duration::from_secs(secs);
+    let mut paused = false;
+    loop {
+        match cmd_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(WorkerCmd::Stop) => {
+                let _ = ev_tx.send(EngineEvent::Waiting(d.id, None));
+                let _ = ev_tx.send(EngineEvent::State(d.id, Status::Queued, None));
+                return Waited::Stopped;
+            }
+            Ok(WorkerCmd::Pause) => {
+                paused = true;
+                let _ = ev_tx.send(EngineEvent::State(d.id, Status::Paused, None));
+            }
+            Ok(WorkerCmd::Run) => {
+                // Resume tries right away.
+                let _ = ev_tx.send(EngineEvent::State(d.id, Status::Downloading, None));
+                return Waited::Again;
+            }
+            Err(_) => {}
+        }
+        if !paused && Instant::now() >= end {
+            return Waited::Again;
+        }
+    }
+}
+
 fn download_worker(d: Download, cmd_rx: Receiver<WorkerCmd>, ev_tx: Sender<EngineEvent>) {
     let _ = ev_tx.send(EngineEvent::State(d.id, Status::Downloading, None));
 
@@ -561,6 +608,8 @@ fn download_worker(d: Download, cmd_rx: Receiver<WorkerCmd>, ev_tx: Sender<Engin
     let _ = fs::create_dir_all(&dir);
     let path = dir.join(&d.file_name);
 
+    // A server that goes silent for this long counts as not answering (each read, not the
+    // whole download).
     let client = match reqwest::blocking::Client::builder()
         .user_agent(
             d.extra
@@ -568,7 +617,8 @@ fn download_worker(d: Download, cmd_rx: Receiver<WorkerCmd>, ev_tx: Sender<Engin
                 .clone()
                 .unwrap_or_else(|| web::DEFAULT_UA.to_string()),
         )
-        .timeout(None)
+        .timeout(Duration::from_secs(45))
+        .connect_timeout(Duration::from_secs(20))
         .build()
     {
         Ok(c) => c,
@@ -578,132 +628,206 @@ fn download_worker(d: Download, cmd_rx: Receiver<WorkerCmd>, ev_tx: Sender<Engin
         }
     };
 
+    // Waits so far while the server was not answering (reset once data flows again).
+    let mut waits = 0usize;
+    let wait = |waits: &mut usize, ev_tx: &Sender<EngineEvent>| -> Option<Waited> {
+        let secs = *web::PATIENT_WAITS.get(*waits)?;
+        *waits += 1;
+        Some(wait_for_server(&d, secs, &cmd_rx, ev_tx))
+    };
+
     // Big files on servers that allow byte ranges: several connections at once.
-    if let multipart::Outcome::Handled = multipart::run(&d, &client, &path, &cmd_rx, &ev_tx) {
-        return;
-    }
-
-    // Resume support: keep what is already on disk and ask for the rest.
-    let mut downloaded: u64 = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    if d.size > 0 && downloaded >= d.size {
-        let _ = ev_tx.send(EngineEvent::State(d.id, Status::Complete, None));
-        return;
-    }
-
-    // Asked like a browser; a refusal is tried again with another Referer.
-    let range = (downloaded > 0).then(|| format!("bytes={}-", downloaded));
-    let sent = web::get_tolerant(&client, &d.url, d.extra.referer.as_deref(), d.extra.cookie.as_deref(), range.as_deref())
-        .map(|(r, _)| r);
-
-    let mut resp = match sent {
-        Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => r,
-        Ok(r) => {
-            // Refused before anything arrived, for a link the browser gave us: the browser,
-            // with its own sign-in, can still download it.
-            if matches!(r.status().as_u16(), 401 | 403) && downloaded == 0 && d.extra.from_browser {
-                let _ = ev_tx.send(EngineEvent::HandBack(d.id));
-                return;
-            }
-            let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(web::status_message(r.status()))));
-            return;
-        }
-        Err(e) => {
-            let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(e.to_string())));
-            return;
-        }
-    };
-
-    let size = if d.size > 0 {
-        d.size
-    } else {
-        resp.content_length().map(|l| l + downloaded).unwrap_or(0)
-    };
-
-    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(e.to_string())));
-            return;
-        }
-    };
-    if downloaded == 0 {
-        let _ = file.set_len(0);
-    }
-
-    let _ = ev_tx.send(EngineEvent::Progress(d.id, downloaded, size, 0.0));
-    let _ = ev_tx.send(EngineEvent::Conns(d.id, 1));
-    let _ = ev_tx.send(EngineEvent::Log(
-        d.id,
-        if downloaded > 0 {
-            format!("Continued with one connection from {}", fmt_size(downloaded))
-        } else {
-            "Started with one connection".to_string()
-        },
-    ));
-
-    let mut buf = [0u8; 64 * 1024];
-    let mut last_report = Instant::now();
-    let mut window_start = Instant::now();
-    let mut window_bytes: u64 = 0;
-    let mut speed: f64 = 0.0;
-    let mut paused = false;
-
     loop {
-        match cmd_rx.try_recv() {
-            Ok(WorkerCmd::Pause) => {
-                paused = true;
-                let _ = ev_tx.send(EngineEvent::State(d.id, Status::Paused, None));
-            }
-            Ok(WorkerCmd::Run) => {
-                paused = false;
-                let _ = ev_tx.send(EngineEvent::State(d.id, Status::Downloading, None));
-                window_start = Instant::now();
-                window_bytes = 0;
-            }
-            Ok(WorkerCmd::Stop) => {
-                let _ = ev_tx.send(EngineEvent::State(d.id, Status::Queued, None));
-                return;
-            }
-            Err(_) => {}
-        }
-
-        if paused {
-            thread::sleep(Duration::from_millis(120));
-            continue;
-        }
-
-        match resp.read(&mut buf) {
-            Ok(0) => {
-                let _ = ev_tx.send(EngineEvent::Progress(d.id, downloaded, size, 0.0));
-                let _ = ev_tx.send(EngineEvent::State(d.id, Status::Complete, None));
-                return;
-            }
-            Ok(n) => {
-                if file.write_all(&buf[..n]).is_err() {
-                    let _ = ev_tx.send(EngineEvent::State(
-                        d.id,
-                        Status::Error,
-                        Some("Could not write the file".into()),
-                    ));
+        match multipart::run(&d, &client, &path, &cmd_rx, &ev_tx) {
+            multipart::Outcome::Handled => return,
+            multipart::Outcome::Fallback => break,
+            multipart::Outcome::Unreachable => match wait(&mut waits, &ev_tx) {
+                Some(Waited::Again) => continue,
+                Some(Waited::Stopped) => return,
+                None => {
+                    let _ = ev_tx.send(EngineEvent::Waiting(d.id, None));
+                    let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(web::NOT_ANSWERING.into())));
                     return;
                 }
-                downloaded += n as u64;
-                window_bytes += n as u64;
+            },
+        }
+    }
 
-                let el = window_start.elapsed().as_secs_f64();
-                if el > 0.5 {
-                    speed = window_bytes as f64 / el;
-                    window_start = Instant::now();
-                    window_bytes = 0;
+    let mut first = true;
+    'connect: loop {
+        // Resume support: keep what is already on disk and ask for the rest.
+        let mut downloaded: u64 = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if d.size > 0 && downloaded >= d.size {
+            let _ = ev_tx.send(EngineEvent::Waiting(d.id, None));
+            let _ = ev_tx.send(EngineEvent::State(d.id, Status::Complete, None));
+            return;
+        }
+
+        // Asked like a browser; a refusal is tried again with another Referer.
+        let range = (downloaded > 0).then(|| format!("bytes={}-", downloaded));
+        let sent = web::get_tolerant(&client, &d.url, d.extra.referer.as_deref(), d.extra.cookie.as_deref(), range.as_deref())
+            .map(|(r, _)| r);
+
+        // Not answering, or answering "busy, try later": wait and try again.
+        let trouble = match &sent {
+            Err(e) => web::unreachable(e),
+            Ok(r) => matches!(r.status().as_u16(), 500 | 502..=504),
+        };
+        if trouble {
+            match wait(&mut waits, &ev_tx) {
+                Some(Waited::Again) => continue 'connect,
+                Some(Waited::Stopped) => return,
+                None => {
+                    let _ = ev_tx.send(EngineEvent::Waiting(d.id, None));
+                    let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(web::NOT_ANSWERING.into())));
+                    return;
                 }
-                if last_report.elapsed().as_millis() > 200 {
-                    last_report = Instant::now();
-                    let _ = ev_tx.send(EngineEvent::Progress(d.id, downloaded, size, speed));
+            }
+        }
+
+        let mut resp = match sent {
+            Ok(r) if r.status().is_success() || r.status().as_u16() == 206 => r,
+            Ok(r) => {
+                // Refused before anything arrived, for a link the browser gave us: the browser,
+                // with its own sign-in, can still download it.
+                if matches!(r.status().as_u16(), 401 | 403) && downloaded == 0 && d.extra.from_browser {
+                    let _ = ev_tx.send(EngineEvent::HandBack(d.id));
+                    return;
                 }
+                let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(web::status_message(r.status()))));
+                return;
             }
             Err(e) => {
                 let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(e.to_string())));
                 return;
+            }
+        };
+        if waits > 0 {
+            waits = 0;
+            let _ = ev_tx.send(EngineEvent::Waiting(d.id, None));
+            let _ = ev_tx.send(EngineEvent::Log(d.id, "The server is answering again".into()));
+        }
+
+        // Asked for the rest but the server sends the whole file: start over.
+        if downloaded > 0 && resp.status().as_u16() != 206 {
+            downloaded = 0;
+        }
+        let size = if d.size > 0 {
+            d.size
+        } else {
+            resp.content_length().map(|l| l + downloaded).unwrap_or(0)
+        };
+
+        // Starting from the beginning: empty the file first. (A file opened for appending
+        // cannot be shortened on Windows, so it is created anew.)
+        if downloaded == 0 {
+            if let Err(e) = fs::File::create(&path) {
+                let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(e.to_string())));
+                return;
+            }
+        }
+        let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(e.to_string())));
+                return;
+            }
+        };
+
+        let _ = ev_tx.send(EngineEvent::Progress(d.id, downloaded, size, 0.0));
+        let _ = ev_tx.send(EngineEvent::Conns(d.id, 1));
+        if first {
+            first = false;
+            let _ = ev_tx.send(EngineEvent::Log(
+                d.id,
+                if downloaded > 0 {
+                    format!("Continued with one connection from {}", fmt_size(downloaded))
+                } else {
+                    "Started with one connection".to_string()
+                },
+            ));
+        }
+
+        let mut buf = [0u8; 64 * 1024];
+        let mut last_report = Instant::now();
+        let mut window_start = Instant::now();
+        let mut window_bytes: u64 = 0;
+        let mut speed: f64 = 0.0;
+        let mut paused = false;
+
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(WorkerCmd::Pause) => {
+                    paused = true;
+                    let _ = ev_tx.send(EngineEvent::State(d.id, Status::Paused, None));
+                }
+                Ok(WorkerCmd::Run) => {
+                    paused = false;
+                    let _ = ev_tx.send(EngineEvent::State(d.id, Status::Downloading, None));
+                    window_start = Instant::now();
+                    window_bytes = 0;
+                }
+                Ok(WorkerCmd::Stop) => {
+                    let _ = ev_tx.send(EngineEvent::State(d.id, Status::Queued, None));
+                    return;
+                }
+                Err(_) => {}
+            }
+
+            if paused {
+                thread::sleep(Duration::from_millis(120));
+                continue;
+            }
+
+            match resp.read(&mut buf) {
+                Ok(0) => {
+                    let _ = ev_tx.send(EngineEvent::Progress(d.id, downloaded, size, 0.0));
+                    // Ended early: the connection was cut. Continue from here.
+                    if size > 0 && downloaded < size {
+                        let _ = ev_tx.send(EngineEvent::Log(d.id, "The connection was cut, continuing".into()));
+                        continue 'connect;
+                    }
+                    let _ = ev_tx.send(EngineEvent::State(d.id, Status::Complete, None));
+                    return;
+                }
+                Ok(n) => {
+                    if file.write_all(&buf[..n]).is_err() {
+                        let _ = ev_tx.send(EngineEvent::State(
+                            d.id,
+                            Status::Error,
+                            Some("Could not write the file".into()),
+                        ));
+                        return;
+                    }
+                    downloaded += n as u64;
+                    window_bytes += n as u64;
+                    throttle::take(n);
+
+                    let el = window_start.elapsed().as_secs_f64();
+                    if el > 0.5 {
+                        speed = window_bytes as f64 / el;
+                        window_start = Instant::now();
+                        window_bytes = 0;
+                    }
+                    if last_report.elapsed().as_millis() > 200 {
+                        last_report = Instant::now();
+                        let _ = ev_tx.send(EngineEvent::Progress(d.id, downloaded, size, speed));
+                    }
+                }
+                Err(e) => {
+                    let _ = ev_tx.send(EngineEvent::Progress(d.id, downloaded, size, 0.0));
+                    // Cut off or silent: wait for the server, then continue from here.
+                    let _ = ev_tx.send(EngineEvent::Log(d.id, format!("The connection was interrupted: {}", e)));
+                    match wait(&mut waits, &ev_tx) {
+                        Some(Waited::Again) => continue 'connect,
+                        Some(Waited::Stopped) => return,
+                        None => {
+                            let _ = ev_tx.send(EngineEvent::Waiting(d.id, None));
+                            let _ = ev_tx.send(EngineEvent::State(d.id, Status::Error, Some(web::NOT_ANSWERING.into())));
+                            return;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1724,9 +1848,13 @@ fn modal(ctx: &egui::Context, p: &Pal, id: &str, width: f32, typical_height: f32
     let snap = |v: f32| (v * ppp).floor() / ppp;
     let screen = ctx.screen_rect();
     let full_w = width + 56.0; // the dialog's inner margin on both sides
+    // Centred on its real height (measured last frame), so a taller dialog is never pushed
+    // past the bottom of the window.
+    let h_id = egui::Id::new((id, "height"));
+    let height = ctx.data(|d| d.get_temp::<f32>(h_id)).unwrap_or(typical_height);
     let pos = pos2(
         snap(((screen.width() - full_w) / 2.0).max(8.0)),
-        snap(((screen.height() - typical_height) / 2.0).max(24.0)),
+        snap(((screen.height() - height) / 2.0).max(16.0)),
     );
     let dialog = egui::Area::new(egui::Id::new((id, "dialog")))
         .order(Order::Foreground)
@@ -1748,6 +1876,11 @@ fn modal(ctx: &egui::Context, p: &Pal, id: &str, width: f32, typical_height: f32
                     ui.with_layout(Layout::top_down(start_align()), add);
                 });
         });
+    let measured = dialog.response.rect.height();
+    if (measured - height).abs() > 0.5 {
+        ctx.data_mut(|d| d.insert_temp(h_id, measured));
+        ctx.request_repaint();
+    }
     // Developer aid: log the dialog's rectangle every frame to spot layout jitter.
     if let Some(path) = std::env::var_os("OREXA_DEBUG_LAYOUT") {
         let r = dialog.response.rect;
@@ -1919,7 +2052,12 @@ fn draw_row(ui: &mut Ui, p: &Pal, icons: &IconCache, d: &Download, selected: boo
         "Size unknown".to_string()
     } else {
         let got = if d.downloaded == 0 { "0 MB".to_string() } else { fmt_size(d.downloaded) };
-        format!("{} of {}, {:.0}%", got, fmt_size(d.size), d.progress() * 100.0)
+        let mut m = format!("{} of {}, {:.0}%", got, fmt_size(d.size), d.progress() * 100.0);
+        // How many connections are fetching it right now.
+        if d.status == Status::Downloading && d.live.retry_at.is_none() && d.live.conns > 0 && !d.is_torrent() {
+            m = if d.live.conns == 1 { format!("{}, 1 connection", m) } else { format!("{}, {} connections", m, d.live.conns) };
+        }
+        m
     };
     let show_bar = d.status != Status::Complete;
     let block_h = if show_bar { 17.0 + 8.0 + 6.0 + 8.0 + 16.0 } else { 17.0 + 4.0 + 16.0 };
@@ -1952,13 +2090,18 @@ fn draw_row(ui: &mut Ui, p: &Pal, icons: &IconCache, d: &Download, selected: boo
     // Status column
     let r1y = cy - 19.0;
     let (r1, r1c, r2): (String, Color32, String) = match d.status {
+        Status::Downloading if d.live.retry_at.is_some() => (
+            "Server not answering".into(),
+            hex(0xD97706),
+            retry_note(d.live.retry_at),
+        ),
         Status::Downloading => (
             fmt_speed(d.speed_bps),
             p.text,
             d.eta_secs().map(|s| format!("{} left", fmt_duration(s))).unwrap_or_else(|| "Starting".into()),
         ),
         Status::Paused => ("Paused".into(), p.text, "Resume any time".into()),
-        Status::Queued => ("Queued".into(), p.text, "Waiting for a free slot".into()),
+        Status::Queued => ("Queued".into(), p.text, schedule::queue_note()),
         Status::Error => ("Failed".into(), p.bad, d.error.clone().unwrap_or_else(|| "Something went wrong".into())),
         Status::Complete => (String::new(), p.text, String::new()),
     };
@@ -2019,6 +2162,14 @@ fn draw_row(ui: &mut Ui, p: &Pal, icons: &IconCache, d: &Download, selected: boo
     }
     if icon_button_at(ui, p, trash, "trash", id.with("trash"), "Remove from list") {
         acts.push(Act::Remove(d.id));
+    }
+}
+
+/// "Trying again in 25 s" for a download waiting on a server that does not answer.
+fn retry_note(at: Option<Instant>) -> String {
+    match at.map(|t| t.saturating_duration_since(Instant::now()).as_secs()) {
+        Some(s) if s > 0 => format!("Trying again in {} s", s),
+        _ => "Trying again now".into(),
     }
 }
 
@@ -2322,6 +2473,38 @@ struct App {
     /// Downloads given back to the browser and when; if the browser never collects one (an
     /// older extension), the row says what to do instead.
     handbacks: HashMap<u64, Instant>,
+    /// The Change link window, and the answers from checking a typed link.
+    relink: Option<relink::Relink>,
+    #[allow(clippy::type_complexity)]
+    relink_tx: Sender<(u64, String, Result<(u64, Option<String>), String>)>,
+    #[allow(clippy::type_complexity)]
+    relink_rx: Receiver<(u64, String, Result<(u64, Option<String>), String>)>,
+    /// Downloads to start once their old connection has wound down.
+    delayed_starts: Vec<(u64, Instant)>,
+    /// The pop-up's height (fitted to what it shows) and where it was opened.
+    floating_h: f32,
+    floating_pos: Option<(u64, egui::Pos2)>,
+    /// The Check file window.
+    check: Option<checksum::CheckDlg>,
+    /// Speed limit for all downloads together (kept while switched off).
+    speed_on: bool,
+    speed_kbs: u64,
+    /// The speed limit as typed, and whether it is in MB/s (else KB/s).
+    speed_text: String,
+    speed_mb: bool,
+    /// Scheduled downloads: start (and optional stop) times as "HH:MM".
+    sched_on: bool,
+    sched_start: String,
+    sched_stop: String,
+    /// Between the start and stop times: the queue may start downloads.
+    sched_active: bool,
+    sched_last_min: Option<u32>,
+    /// Leftovers found in Settings (None until looked for).
+    leftovers: Option<Vec<cleanup::Leftover>>,
+    /// Files to send to the Recycle Bin once their download has let go of them.
+    pending_recycle: Vec<(Vec<PathBuf>, Instant)>,
+    /// Removing an unfinished download also clears away its partial file.
+    delete_files: bool,
     /// Keep the pop-up above other windows until then (so a finished download is seen).
     floating_top_until: Option<Instant>,
     after_finish: AfterFinish,
@@ -2383,6 +2566,7 @@ impl App {
         let (setup_tx, setup_rx) = channel::<SetupEvent>();
         let (update_tx, update_rx) = channel::<UpdateMsg>();
         let (thumb_tx, thumb_rx) = channel::<(u64, Thumb)>();
+        let (relink_tx, relink_rx) = channel();
         let mut app = Self {
             downloads: if o.demo { demo_with_details(sample_downloads()) } else { Vec::new() },
             engine,
@@ -2451,6 +2635,25 @@ impl App {
             update_launched: false,
             update_closing: None,
             handbacks: HashMap::new(),
+            relink: None,
+            relink_tx,
+            relink_rx,
+            delayed_starts: Vec::new(),
+            floating_h: 500.0,
+            floating_pos: None,
+            check: None,
+            speed_on: false,
+            speed_kbs: 1024,
+            speed_text: "1".into(),
+            speed_mb: true,
+            sched_on: false,
+            sched_start: "02:00".into(),
+            sched_stop: String::new(),
+            sched_active: false,
+            sched_last_min: None,
+            leftovers: None,
+            pending_recycle: Vec::new(),
+            delete_files: true,
             after_finish: AfterFinish::Nothing,
             batch_done: false,
             last_done_dir: None,
@@ -2540,10 +2743,34 @@ impl App {
                 }
             }
             Some("settings") => app.page = Page::Settings,
+            Some("settings-on") => {
+                app.page = Page::Settings;
+                app.speed_on = true;
+                app.sched_on = true;
+                app.sched_stop = "07:00".into();
+            }
             Some("welcome") => app.welcome_open = true,
             Some("select") => app.selected = app.downloads.iter().take(3).map(|d| d.id).collect(),
             Some("details") => app.details_wait = true,
             Some("details-dl") => app.details_id = app.downloads.iter().find(|d| !d.is_torrent() && d.status == Status::Downloading).map(|d| d.id),
+            // The pop-up window, for a running or a finished download.
+            Some("popup") => app.floating = app.downloads.iter().find(|d| !d.is_torrent() && d.status == Status::Downloading).map(|d| d.id),
+            Some("relink") => {
+                if let Some(id) = app.downloads.iter().find(|d| matches!(d.source, Source::Http) && d.status != Status::Complete).map(|d| d.id) {
+                    app.open_relink(id);
+                    if let Some(r) = app.relink.as_mut() {
+                        r.url = "https://mirror.example.org/files/ubuntu-24.04-desktop-amd64.iso".into();
+                        r.state = relink::RelinkState::Same(5_368_709_120);
+                    }
+                }
+            }
+            Some("check") => {
+                if let Some(id) = app.downloads.iter().find(|d| matches!(d.source, Source::Http) && d.status == Status::Complete).map(|d| d.id) {
+                    app.open_check(id);
+                }
+            }
+            Some("delete") => app.confirm_delete = app.downloads.iter().filter(|d| d.status != Status::Complete).map(|d| d.id).take(1).collect(),
+            Some("popup-done") => app.floating = app.downloads.iter().find(|d| !d.is_torrent() && d.status == Status::Complete).map(|d| d.id),
             Some("help") => app.help_open = true,
             Some("help-edge") => {
                 app.help_open = true;
@@ -2904,6 +3131,20 @@ impl App {
 
     /// Add a browser download to the list: start it now, or leave it queued.
     fn accept_browser_download(&mut self, mut d: Download, queue: bool) {
+        // The browser found another link for a file that is half downloaded already (the old
+        // server went down, or the link expired): continue that one instead of starting over.
+        if matches!(d.source, Source::Http) {
+            let old = self.same_file(&d.file_name, d.size, &d.url).filter(|o| o.status != Status::Complete).map(|o| (o.id, o.file_name.clone()));
+            if let Some((old_id, name)) = old {
+                self.relink_to(old_id, d.url.clone(), d.extra.clone());
+                if self.notify_done {
+                    shell::toast("Continuing your unfinished download".into(), name);
+                }
+                self.floating = Some(old_id);
+                self.floating_front = true;
+                return;
+            }
+        }
         self.make_name_unique(&mut d);
         if self.notify_done {
             shell::toast(
@@ -3279,6 +3520,11 @@ impl App {
 
     fn delete_confirmed(&mut self) {
         for id in std::mem::take(&mut self.confirm_delete) {
+            // An unfinished file is of no use without its download: to the Recycle Bin.
+            if self.delete_files {
+                let files = self.downloads.iter().find(|d| d.id == id).map(cleanup::unfinished_files).unwrap_or_default();
+                self.recycle_later(files);
+            }
             self.engine.cancel(id);
             self.downloads.retain(|d| d.id != id);
             self.selected.remove(&id);
@@ -3322,6 +3568,14 @@ impl App {
                         self.floating = None;
                     }
                 }
+                EngineEvent::Waiting(id, secs) => {
+                    if let Some(d) = self.downloads.iter_mut().find(|x| x.id == id) {
+                        d.live.retry_at = secs.map(|s| Instant::now() + Duration::from_secs(s));
+                        if secs.is_some() {
+                            d.speed_bps = 0.0;
+                        }
+                    }
+                }
                 EngineEvent::Conns(id, n) => {
                     if let Some(d) = self.downloads.iter_mut().find(|x| x.id == id) {
                         d.live.conns = n;
@@ -3352,6 +3606,7 @@ impl App {
                         if status != Status::Downloading {
                             d.speed_bps = 0.0;
                             d.live.conns = 0;
+                            d.live.retry_at = None;
                         }
                         if status == Status::Complete && d.size > 0 {
                             d.downloaded = d.size;
@@ -3380,7 +3635,8 @@ impl App {
 
     // Start waiting downloads when fewer than max_parallel are running.
     fn pump_queue(&mut self) {
-        if self.demo {
+        // Scheduled downloads wait for their start time.
+        if self.demo || !self.queue_open() {
             return;
         }
         let mut active = self.downloads.iter().filter(|d| d.status == Status::Downloading).count();
@@ -4002,28 +4258,24 @@ impl App {
                 let line = |ui: &mut Ui, title: &str, desc: &str, last: bool, ctl: &mut dyn FnMut(&mut Ui)| {
                     egui::Frame::none().inner_margin(Margin::symmetric(24.0, 18.0)).show(ui, |ui| {
                         ui.set_width(cw - 48.0);
-                        if rtl() {
-                            // Text on the right, controls on the left.
-                            ui.horizontal(|ui| {
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    ui.with_layout(Layout::top_down(Align::Max), |ui| {
-                                        ui.spacing_mut().item_spacing.y = 2.0;
-                                        lbl(ui, title, fs(14.0), p.text);
-                                        lbl(ui, desc, f(13.0), p.muted);
-                                    });
-                                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| ctl(ui));
-                                });
-                            });
-                        } else {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
+                        // The controls are placed first, at the far edge; the text gets the room
+                        // that is left and wraps there, so a long description never runs under them.
+                        ui.horizontal(|ui| {
+                            let (edge, text_align) = if rtl() {
+                                (Layout::left_to_right(Align::Center), Align::Max)
+                            } else {
+                                (Layout::right_to_left(Align::Center), Align::Min)
+                            };
+                            ui.with_layout(edge, |ui| {
+                                ctl(ui);
+                                ui.add_space(16.0);
+                                ui.with_layout(Layout::top_down(text_align), |ui| {
                                     ui.spacing_mut().item_spacing.y = 2.0;
                                     lbl(ui, title, fs(14.0), p.text);
                                     lbl(ui, desc, f(13.0), p.muted);
                                 });
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| ctl(ui));
                             });
-                        }
+                        });
                     });
                     if !last {
                         let y = ui.cursor().top();
@@ -4158,6 +4410,97 @@ impl App {
                     shell::open_default_apps();
                 }
 
+                // Speed limit and scheduled downloads.
+                let (speed_on, speed_text, speed_mb, speed_kbs) =
+                    (&mut self.speed_on, &mut self.speed_text, &mut self.speed_mb, &mut self.speed_kbs);
+                let (sched_on, sched_start, sched_stop) = (&mut self.sched_on, &mut self.sched_start, &mut self.sched_stop);
+                let sched_active = self.sched_active;
+                card(ui, &mut |ui| {
+                    line(ui, "Limit download speed", "All downloads together stay under this speed.", false, &mut |ui| {
+                        toggle(ui, p, speed_on);
+                        if *speed_on {
+                            ui.add_space(12.0);
+                            // KB/s or MB/s.
+                            let (r, _) = ui.allocate_exact_size(vec2(124.0, 36.0), Sense::hover());
+                            ui.painter().rect_filled(r, 9.0, p.tile);
+                            let mut unit_changed = false;
+                            for (i, (label, mb)) in [("KB/s", false), ("MB/s", true)].iter().enumerate() {
+                                let o = mrect(r, Rect::from_min_size(pos2(r.left() + 3.0 + i as f32 * 59.0, r.top() + 3.0), vec2(59.0, 30.0)));
+                                let sel = *speed_mb == *mb;
+                                let resp = ui.interact(o, egui::Id::new(("speed_unit", i)), Sense::click());
+                                if sel {
+                                    ui.painter().rect_filled(o, 7.0, if p.dark { p.border_strong } else { p.surface });
+                                }
+                                if resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                                ui.painter().txt(o.center(), Align2::CENTER_CENTER, *label, if sel { fs(13.0) } else { f(13.0) }, if sel { p.text } else { p.sub });
+                                if resp.clicked() && !sel {
+                                    *speed_mb = *mb;
+                                    unit_changed = true;
+                                }
+                            }
+                            ui.add_space(8.0);
+                            let te = ui.add(
+                                egui::TextEdit::singleline(speed_text)
+                                    .font(f(14.0))
+                                    .text_color(p.text)
+                                    .horizontal_align(Align::Center)
+                                    .margin(Margin::symmetric(8.0, 8.0))
+                                    .desired_width(64.0),
+                            );
+                            if te.changed() || unit_changed {
+                                let v: f64 = speed_text.trim().replace(',', ".").parse().unwrap_or(0.0);
+                                if v > 0.0 {
+                                    *speed_kbs = ((if *speed_mb { v * 1024.0 } else { v }).round() as u64).max(8);
+                                }
+                            }
+                        }
+                    });
+                    stacked(
+                        ui,
+                        "Scheduled downloads",
+                        "Queued downloads wait for the start time, for example at night. Orexa has to be running, in the tray is enough.",
+                        &mut |ui| {
+                            toggle(ui, p, sched_on);
+                            if *sched_on {
+                                ui.add_space(14.0);
+                                let time_box = |ui: &mut Ui, v: &mut String, hint: &str| {
+                                    let bad = !v.trim().is_empty() && schedule::parse_hm(v).is_none();
+                                    let mut te = egui::TextEdit::singleline(v)
+                                        .font(f(14.0))
+                                        .text_color(if bad { p.bad } else { p.text })
+                                        .horizontal_align(Align::Center)
+                                        .margin(Margin::symmetric(8.0, 8.0))
+                                        .desired_width(64.0);
+                                    if !hint.is_empty() {
+                                        te = te.hint_text(rt(hint, f(13.0), p.muted));
+                                    }
+                                    ui.add(te);
+                                };
+                                lbl(ui, "Start at", f(14.0), p.sub);
+                                ui.add_space(6.0);
+                                time_box(ui, sched_start, "02:00");
+                                ui.add_space(14.0);
+                                lbl(ui, "Stop at", f(14.0), p.sub);
+                                ui.add_space(6.0);
+                                time_box(ui, sched_stop, "--:--");
+                                ui.add_space(14.0);
+                                let note = if schedule::parse_hm(sched_start).is_none() {
+                                    ("Use a time like 02:00".to_string(), p.bad)
+                                } else if sched_active {
+                                    ("Running now".to_string(), p.ok)
+                                } else if sched_stop.trim().is_empty() {
+                                    ("Stops when the queue is done".to_string(), p.muted)
+                                } else {
+                                    (format!("Starts at {}", sched_start.trim()), p.muted)
+                                };
+                                lbl(ui, note.0, f(13.0), note.1);
+                            }
+                        },
+                    );
+                });
+
                 let after = &mut self.after_finish;
                 card(ui, &mut |ui| {
                     stacked(ui, "When all downloads finish", "Choose what Orexa does once nothing is left to download.", &mut |ui| {
@@ -4241,6 +4584,48 @@ impl App {
                         }
                     });
                 });
+
+                // Leftovers of unfinished downloads that are no longer in the list.
+                let mut look = false;
+                let mut clear = false;
+                let leftovers = self.leftovers.clone();
+                card(ui, &mut |ui| {
+                    let desc = match &leftovers {
+                        None => "Partial files of unfinished downloads that are no longer in your list.".to_string(),
+                        Some(v) if v.is_empty() => "Nothing to clean up.".to_string(),
+                        Some(v) => {
+                            let total: u64 = v.iter().map(|l| l.size).sum();
+                            let n = v.len();
+                            if n == 1 {
+                                format!("Found 1 leftover, {}.", fmt_size(total))
+                            } else {
+                                format!("Found {} leftovers, {}.", n, fmt_size(total))
+                            }
+                        }
+                    };
+                    line(ui, "Leftovers", &desc, true, &mut |ui| match &leftovers {
+                        Some(v) if !v.is_empty() => {
+                            if button(ui, p, "Move to Recycle Bin", Some("trash"), Kind::Secondary, 36.0, true).clicked() {
+                                clear = true;
+                            }
+                        }
+                        _ => {
+                            if button(ui, p, "Look for leftovers", Some("search"), Kind::Secondary, 36.0, true).clicked() {
+                                look = true;
+                            }
+                        }
+                    });
+                });
+                if look {
+                    self.scan_leftovers();
+                }
+                if clear {
+                    if let Some(v) = self.leftovers.take() {
+                        let files: Vec<PathBuf> = v.iter().flat_map(|l| [Some(l.side.clone()), l.file.clone()]).flatten().collect();
+                        shell::recycle(&files);
+                    }
+                    self.scan_leftovers();
+                }
 
                 let copied = self.copied_diag.map(|t| t.elapsed() < Duration::from_secs(3)).unwrap_or(false);
                 let mut copy_diag = false;
@@ -4336,6 +4721,21 @@ impl App {
             self.dialog.save_dir = self.dir_for(&self.default_dir, &self.dialog.file_name, torrent);
         }
         let dup = self.duplicate_of(self.dialog.url.trim());
+        // The same file from another link (a mirror): its name and size match one in the list.
+        let same: Option<(u64, Status, u64, u64, String)> = match (&dup, &self.dialog.probe) {
+            (None, ProbeState::Ready(sz, _)) => self
+                .same_file(&self.dialog.file_name, *sz, self.dialog.url.trim())
+                .map(|d| (d.id, d.status, d.downloaded, d.size, d.added.clone())),
+            _ => None,
+        };
+        // With the scheduler waiting, the queue starts later: say when.
+        let queue_hint = if self.queue_open() {
+            "Turn off to add it to the queue instead.".to_string()
+        } else {
+            format!("Turn off to add it to the queue. Queued downloads start at {}.", self.sched_start.trim())
+        };
+        let mut continue_same: Option<u64> = None;
+        let mut reveal_same: Option<u64> = None;
 
         let dlg = &mut self.dialog;
         let mut marks: Vec<(&str, f32)> = Vec::new();
@@ -4718,6 +5118,42 @@ impl App {
                 ui.add_space(14.0);
             }
 
+            // The same file is already in the list, from another link.
+            if let Some((sid, st, got, size, added)) = &same {
+                egui::Frame::none()
+                    .fill(p.accent_soft)
+                    .rounding(10.0)
+                    .inner_margin(Margin::symmetric(12.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        if *st == Status::Complete {
+                            lbl(ui,
+                                format!("You already downloaded this file ({}). Downloading it again saves a second copy.", added),
+                                f(13.0),
+                                p.accent_ink,
+                            );
+                            if button(ui, p, "Show in folder", Some("folder"), Kind::Secondary, 32.0, true).clicked() {
+                                reveal_same = Some(*sid);
+                            }
+                        } else {
+                            lbl(ui,
+                                format!(
+                                    "You have an unfinished copy of this file ({} of {}). Continue it from this link instead of starting over.",
+                                    if *got == 0 { "0 MB".to_string() } else { fmt_size(*got) },
+                                    fmt_size(*size)
+                                ),
+                                f(13.0),
+                                p.accent_ink,
+                            );
+                            if button(ui, p, "Continue it", Some("play"), Kind::Primary, 32.0, true).clicked() {
+                                continue_same = Some(*sid);
+                            }
+                        }
+                    });
+                ui.add_space(14.0);
+            }
+
             marks.push(("after_card", ui.cursor().top()));
             lbl(ui, "Save to", fs(13.0), p.sub);
             ui.add_space(6.0);
@@ -4773,7 +5209,7 @@ impl App {
                     col(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         lbl(ui, "Start downloading now", fs(14.0), p.text);
-                        lbl(ui, "Turn off to add it to the queue instead.", f(13.0), p.muted);
+                        lbl(ui, &queue_hint, f(13.0), p.muted);
                     });
                     ui.with_layout(rl_layout(Align::Center), |ui| {
                         toggle(ui, p, &mut dlg.start_now);
@@ -4820,6 +5256,17 @@ impl App {
         if let Some(t) = setup_req {
             self.start_setup(t);
         }
+        if let Some(id) = reveal_same {
+            if let Some(d) = self.downloads.iter().find(|x| x.id == id) {
+                reveal_path(&d.path());
+            }
+        }
+        if let Some(id) = continue_same {
+            let (url, extra) = (self.dialog.url.trim().to_string(), self.dialog.extra.clone());
+            self.close_dialog();
+            self.relink_to(id, url, extra);
+            return;
+        }
         if close {
             self.close_dialog();
         } else if ok && submit_queue {
@@ -4841,19 +5288,42 @@ impl App {
             .unwrap_or_default();
         let mut yes = false;
         let mut no = false;
-        modal(ctx, p, "delete", 400.0, 220.0, |ui| {
+        // Unfinished files among them (partial files are useless once the download is gone).
+        let unfinished: u64 = self
+            .downloads
+            .iter()
+            .filter(|d| self.confirm_delete.contains(&d.id))
+            .flat_map(cleanup::unfinished_files)
+            .map(|f| fs::metadata(f).map(|m| m.len()).unwrap_or(0))
+            .sum::<u64>();
+        let has_unfinished = self.downloads.iter().any(|d| self.confirm_delete.contains(&d.id) && !cleanup::unfinished_files(d).is_empty());
+        let delete_files = &mut self.delete_files;
+        modal(ctx, p, "delete", 420.0, 240.0, |ui| {
             if many > 1 {
                 lbl(ui, format!("Remove {} downloads?", many), fb(20.0), p.text);
                 ui.add_space(8.0);
-                lbl(ui, "They will leave the list. The files on your disk are not deleted.", f(14.0), p.sub);
+                lbl(ui, "They will leave the list. Finished files on your disk are kept.", f(14.0), p.sub);
             } else {
                 lbl(ui, "Remove this download?", fb(20.0), p.text);
                 ui.add_space(8.0);
                 lbl(ui,
-                    format!("{} will leave the list. The file on your disk is not deleted.", name),
+                    if has_unfinished {
+                        format!("{} will leave the list.", name)
+                    } else {
+                        format!("{} will leave the list. The file on your disk is not deleted.", name)
+                    },
                     f(14.0),
                     p.sub,
                 );
+            }
+            if has_unfinished {
+                ui.add_space(12.0);
+                let label = if many > 1 {
+                    format!("Also move the unfinished files to the Recycle Bin ({})", fmt_size(unfinished))
+                } else {
+                    format!("Also move the unfinished file to the Recycle Bin ({})", fmt_size(unfinished))
+                };
+                ui.checkbox(delete_files, rt(label, f(13.0), p.text));
             }
             ui.add_space(24.0);
             let fw = ui.available_width();
@@ -4894,6 +5364,10 @@ struct DetailsOut {
     popup: bool,
     /// Stop the download and close the window (it can be resumed later from the app).
     cancel: bool,
+    /// Continue it from another address.
+    change_link: bool,
+    /// Compare the finished file with its published checksum.
+    check: bool,
 }
 
 /// The content of a download's details window (used in the app and in the pop-up).
@@ -4907,7 +5381,9 @@ fn download_details_body(ui: &mut Ui, p: &Pal, d: &Download, screen_h: f32, expa
         };
         let eta = d.eta_secs().map(fmt_duration).unwrap_or_else(|| "-".into());
         let pct = (d.progress() * 100.0).round();
-        let stats: Vec<(&str, String)> = vec![
+        let waiting = d.status == Status::Downloading && d.live.retry_at.is_some();
+        let status = if waiting { "Server not answering" } else { status };
+        let mut stats: Vec<(&str, String)> = vec![
             ("State", status.to_string()),
             ("File size", fmt_size(d.size)),
             (
@@ -4923,6 +5399,11 @@ fn download_details_body(ui: &mut Ui, p: &Pal, d: &Download, screen_h: f32, expa
             ("Download speed", if d.status == Status::Downloading { fmt_speed(d.speed_bps) } else { "-".into() }),
             ("Time left", if d.status == Status::Downloading { eta } else { "-".into() }),
         ];
+        if waiting {
+            stats.insert(1, ("Next try", retry_note(d.live.retry_at)));
+        } else if d.status == Status::Downloading && d.live.conns > 0 && !d.is_torrent() {
+            stats.push(("Connections", d.live.conns.to_string()));
+        }
 
         {
             ui.set_max_height(screen_h);
@@ -4989,11 +5470,17 @@ fn download_details_body(ui: &mut Ui, p: &Pal, d: &Download, screen_h: f32, expa
                     hrow(ui, |ui| {
                         let (r, _) = ui.allocate_exact_size(vec2(130.0, 18.0), Sense::hover());
                         ui.painter().txtm(r, r.left_center(), Align2::LEFT_CENTER, "Link", f(13.0), p.muted);
-                        let w = (ui.available_width() - 80.0).max(80.0);
+                        // An unfinished file download can continue from another address.
+                        let can_change = d.status != Status::Complete && matches!(d.source, Source::Http);
+                        let btns = text_w(ui, "Copy", fs(14.0)) + 44.0 + if can_change { text_w(ui, "Change", fs(14.0)) + 44.0 } else { 0.0 };
+                        let w = (ui.available_width() - btns).max(80.0);
                         let g = trunc(ui, &trunc_str(&d.url, 70), f(13.0), p.text, w);
                         ui.label(g);
                         if button(ui, p, "Copy", None, Kind::Secondary, 26.0, true).clicked() {
                             out.copy_link = true;
+                        }
+                        if can_change && button(ui, p, "Change", None, Kind::Secondary, 26.0, true).clicked() {
+                            out.change_link = true;
                         }
                     });
                     for (k, v) in &stats {
@@ -5003,6 +5490,16 @@ fn download_details_body(ui: &mut Ui, p: &Pal, d: &Download, screen_h: f32, expa
                             let w = ui.available_width();
                             let g = trunc(ui, v, f(13.0), p.text, w);
                             ui.label(g);
+                        });
+                    }
+                    // A finished file can be compared with the checksum its website publishes.
+                    if d.status == Status::Complete && !d.is_torrent() {
+                        hrow(ui, |ui| {
+                            let (r, _) = ui.allocate_exact_size(vec2(130.0, 18.0), Sense::hover());
+                            ui.painter().txtm(r, r.left_center(), Align2::LEFT_CENTER, "Checksum", f(13.0), p.muted);
+                            if button(ui, p, "Check file", Some("check"), Kind::Secondary, 26.0, true).clicked() {
+                                out.check = true;
+                            }
                         });
                     }
                 });
@@ -5130,6 +5627,7 @@ fn download_details_body(ui: &mut Ui, p: &Pal, d: &Download, screen_h: f32, expa
                 if button(ui, p, "Show in folder", Some("folder"), Kind::Secondary, 40.0, true).clicked() {
                     out.folder = true;
                 }
+
                 ui.with_layout(rl_layout(Align::Center), |ui| {
                     // In the pop-up this button cancels the download; a finished one just closes.
                     if out.popup && d.status != Status::Complete {
@@ -5750,7 +6248,15 @@ impl App {
         let screen_h = ctx.screen_rect().height();
         let mut out = DetailsOut::default();
         let mut expanded = self.details_expanded;
-        modal(ctx, p, "details", width, 460.0, |ui| download_details_body(ui, p, &d, screen_h, &mut expanded, &mut out));
+        // Taller than the window (a small window, details shown): it scrolls, so the buttons
+        // can always be reached.
+        modal(ctx, p, "details", width, 460.0, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("details_scroll")
+                .max_height((screen_h - 32.0 - 56.0).max(200.0))
+                .auto_shrink([false, true])
+                .show(ui, |ui| download_details_body(ui, p, &d, screen_h, &mut expanded, &mut out));
+        });
         self.details_expanded = expanded;
         if out.close {
             self.details_id = None;
@@ -5760,6 +6266,23 @@ impl App {
 
     /// Carry out what a details window asked for.
     fn details_actions(&mut self, d: &Download, out: &DetailsOut) {
+        if out.check {
+            if self.details_id == Some(d.id) {
+                self.details_id = None;
+            }
+            if self.floating == Some(d.id) {
+                self.floating = None;
+            }
+            self.open_check(d.id);
+            return;
+        }
+        if out.change_link {
+            if self.details_id == Some(d.id) {
+                self.details_id = None;
+            }
+            self.open_relink(d.id);
+            return;
+        }
         if out.copy_link {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 let _ = cb.set_text(d.url.clone());
@@ -5829,21 +6352,32 @@ impl App {
             return;
         };
         let mut out = DetailsOut { popup: true, ..Default::default() };
-        let (w, h) = (560.0_f32, if self.details_expanded { 770.0_f32 } else { 500.0 });
-        // Open in the middle of the screen.
         let ppp = ctx.pixels_per_point().max(0.5);
         let (sw, sh) = ctx
             .input(|i| i.viewport().monitor_size)
             .map(|m| (m.x, m.y))
             .or_else(|| shell::screen_size().map(|(x, y)| (x / ppp, y / ppp)))
             .unwrap_or((1920.0, 1080.0));
-        let pos = pos2(((sw - w) / 2.0).max(0.0), ((sh - h) / 2.0).max(0.0));
+        // As tall as what it shows (measured each frame), never taller than the screen.
+        let max_h = (sh - 60.0).max(360.0);
+        let w = 560.0_f32;
+        let h = self.floating_h.clamp(300.0, max_h);
+        // Opens in the middle of the screen, then stays where it is put.
+        let pos = match self.floating_pos {
+            Some((fid, at)) if fid == id => at,
+            _ => {
+                let at = pos2(((sw - w) / 2.0).max(0.0), ((sh - 560.0) / 2.0).max(0.0));
+                self.floating_pos = Some((id, at));
+                at
+            }
+        };
+        let mut fit_h = h;
         let builder = egui::ViewportBuilder::default()
             .with_position(pos)
             .with_title(format!("{} - Orexa Downloader", d.file_name))
             .with_decorations(false)
             .with_inner_size([w, h])
-            .with_min_inner_size([460.0, 360.0])
+            .with_min_inner_size([460.0, 300.0])
             .with_icon(window_icon())
             .with_active(true);
         let pal = p.clone();
@@ -5894,9 +6428,24 @@ impl App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(pal.surface).inner_margin(Margin::same(24.0)))
                 .show(ctx, |ui| {
-                    let h = ctx.screen_rect().height() + 140.0;
-                    download_details_body(ui, &pal, &d, h, &mut expanded, &mut out);
+                    // Only on a very small screen is there anything to scroll.
+                    let body_max = (max_h - 40.0 - 48.0).max(200.0);
+                    let o = egui::ScrollArea::vertical()
+                        .id_salt("float_scroll")
+                        .max_height(body_max)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| download_details_body(ui, &pal, &d, 2000.0, &mut expanded, &mut out));
+                    fit_h = (40.0 + 48.0 + 8.0 + o.content_size.y.min(body_max)).ceil();
                 });
+            // Growing would push the bottom (and its buttons) off the screen: move up first.
+            if fit_h > ctx.screen_rect().height() + 1.0 {
+                if let Some(o) = ctx.input(|i| i.viewport().outer_rect) {
+                    let limit = sh - 48.0; // above the taskbar
+                    if o.top() + fit_h > limit {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos2(o.left(), (limit - fit_h).max(0.0))));
+                    }
+                }
+            }
             if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
                 out.close = true;
             }
@@ -5908,12 +6457,13 @@ impl App {
             } else if !on_top && was_on_top {
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
             }
-            if out.resized {
-                let h = if expanded { 770.0 } else { 500.0 };
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(560.0, h)));
-            }
             ctx.request_repaint_after(Duration::from_millis(300));
         });
+        // A new height takes effect next frame (the window follows its builder's size).
+        if (fit_h - self.floating_h).abs() > 1.0 {
+            self.floating_h = fit_h;
+            ctx.request_repaint();
+        }
         self.details_expanded = expanded;
         if out.close {
             self.floating = None;
@@ -6445,6 +6995,14 @@ impl eframe::App for App {
             self.auto_add = false;
             self.add_download(true);
         }
+        self.poll_relink();
+        self.run_delayed_starts();
+        self.run_pending_recycle();
+        let want = if self.speed_on { self.speed_kbs * 1024 } else { 0 };
+        if throttle::get() != want {
+            throttle::set(want);
+        }
+        self.tick_schedule();
         self.pump_queue();
         self.tick_demo();
         self.sample_speed();
@@ -6482,6 +7040,8 @@ impl eframe::App for App {
             });
         self.ui_add_dialog(ctx, &p);
         self.ui_delete_dialog(ctx, &p);
+        self.ui_relink_dialog(ctx, &p);
+        self.ui_check_dialog(ctx, &p);
         self.ui_help_dialog(ctx, &p);
         self.ui_welcome(ctx, &p);
         self.ui_update_dialog(ctx, &p);
@@ -6772,6 +7332,9 @@ mod polish_tests {
         i18n::set(i18n::Lang::Ar);
         assert_eq!(i18n::translate("3 selected").as_deref(), Some("3 محدد"));
         assert_eq!(i18n::translate("Remove 4 downloads?").as_deref(), Some("إزالة 4 تنزيلات؟"));
+        assert_eq!(i18n::translate("Trying again in 25 s").as_deref(), Some("محاولة جديدة بعد 25 ث"));
+        assert_eq!(i18n::translate("Starts at 02:00").as_deref(), Some("يبدأ في 02:00"));
+        assert_eq!(i18n::translate("Matches (SHA-256)").as_deref(), Some("مطابق (SHA-256)"));
         i18n::set(i18n::Lang::En);
     }
 }

@@ -352,6 +352,52 @@ pub fn free_space(path: &std::path::Path) -> Option<u64> {
     (ok != 0).then_some(free)
 }
 
+/// Move files to the Recycle Bin (they can be restored from there). Missing files are
+/// skipped. Returns false when Windows could not do it.
+pub fn recycle(paths: &[std::path::PathBuf]) -> bool {
+    #[repr(C)]
+    struct FileOp {
+        hwnd: isize,
+        func: u32,
+        from: *const u16,
+        to: *const u16,
+        flags: u16,
+        aborted: i32,
+        mappings: *mut std::ffi::c_void,
+        title: *const u16,
+    }
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHFileOperationW(op: *mut FileOp) -> i32;
+    }
+    const FO_DELETE: u32 = 3;
+    const FOF_SILENT: u16 = 0x4;
+    const FOF_NOCONFIRMATION: u16 = 0x10;
+    const FOF_ALLOWUNDO: u16 = 0x40;
+    const FOF_NOERRORUI: u16 = 0x400;
+    // A list of names, each ending with a zero, and one more zero at the end.
+    let mut list: Vec<u16> = Vec::new();
+    for p in paths.iter().filter(|p| p.exists()) {
+        list.extend(p.to_string_lossy().encode_utf16());
+        list.push(0);
+    }
+    if list.is_empty() {
+        return true;
+    }
+    list.push(0);
+    let mut op = FileOp {
+        hwnd: 0,
+        func: FO_DELETE,
+        from: list.as_ptr(),
+        to: std::ptr::null(),
+        flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
+        aborted: 0,
+        mappings: std::ptr::null_mut(),
+        title: std::ptr::null(),
+    };
+    unsafe { SHFileOperationW(&mut op) == 0 }
+}
+
 fn reg(args: &[&str]) -> (bool, String) {
     let mut c = Command::new("reg");
     #[cfg(windows)]

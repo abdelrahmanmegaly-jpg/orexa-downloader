@@ -1,6 +1,6 @@
 [package]
 name = "orexa-downloader"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Orexa Downloader"
 
@@ -19,6 +19,8 @@ tray-icon = "0.19"
 tauri-winrt-notification = "0.7"
 arboard = "3"
 sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
 ar-reshaper = "1.5"
 unicode-bidi = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -773,6 +773,10 @@ fn run_once(
     }
     cmd.arg("-P").arg(dir);
     cmd.arg("-o").arg(format!("{}.%(ext)s", stem));
+    // The speed limit from Settings (bytes per second).
+    if crate::throttle::get() > 0 {
+        cmd.arg("--limit-rate").arg(crate::throttle::get().to_string());
+    }
     cmd.args(format_args(o, ffmpeg.is_some()));
     if let Some(ff) = &ffmpeg {
         if let Some(parent) = ff.parent() {

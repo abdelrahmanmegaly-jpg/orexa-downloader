@@ -22,18 +22,31 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+static SESSION: Mutex<Option<Arc<Session>>> = Mutex::new(None);
+
 /// One engine for the whole app, created the first time a torrent is added.
 fn session() -> Result<Arc<Session>, String> {
-    static S: Mutex<Option<Arc<Session>>> = Mutex::new(None);
-    let mut g = S.lock().unwrap();
+    let mut g = SESSION.lock().unwrap();
     if let Some(s) = g.as_ref() {
         return Ok(s.clone());
     }
     let s = runtime()
         .block_on(Session::new(downloads_dir()))
         .map_err(|e| format!("Could not start the torrent engine: {}", e))?;
+    s.ratelimits.set_download_bps(bps_limit(crate::throttle::get()));
     *g = Some(s.clone());
     Ok(s)
+}
+
+fn bps_limit(bps: u64) -> Option<std::num::NonZeroU32> {
+    std::num::NonZeroU32::new(bps.min(u32::MAX as u64) as u32)
+}
+
+/// The speed limit from Settings, for torrents too (0 = none). Applies once the engine runs.
+pub fn apply_speed_limit(bps: u64) {
+    if let Some(s) = SESSION.lock().unwrap().as_ref() {
+        s.ratelimits.set_download_bps(bps_limit(bps));
+    }
 }
 
 // ---------------------------------------------------------------------------

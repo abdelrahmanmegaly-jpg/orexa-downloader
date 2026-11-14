@@ -38,6 +38,8 @@ pub enum Outcome {
     Handled,
     /// Not suitable (no range support, small file...): use the single-connection path.
     Fallback,
+    /// The server did not answer at all: wait, then try again.
+    Unreachable,
 }
 
 pub fn side_path(file: &Path) -> PathBuf {
@@ -58,22 +60,36 @@ fn part_request(client: &Client, d: &Download) -> RequestBuilder {
 }
 
 /// Ask for the first byte: a 206 answer with a total means ranges work. Also returns the
-/// Referer the server accepted.
-fn probe_ranges(client: &Client, d: &Download) -> Option<(u64, Option<String>)> {
+/// Referer the server accepted. Err means the server could not be reached at all.
+fn probe_ranges(client: &Client, d: &Download) -> Result<Option<(u64, Option<String>)>, ()> {
     let (resp, referer) =
-        crate::web::get_tolerant(client, &d.url, d.extra.referer.as_deref(), d.extra.cookie.as_deref(), Some("bytes=0-0")).ok()?;
-    if resp.status().as_u16() != 206 {
-        return None;
+        match crate::web::get_tolerant(client, &d.url, d.extra.referer.as_deref(), d.extra.cookie.as_deref(), Some("bytes=0-0")) {
+            Ok(r) => r,
+            Err(e) if crate::web::unreachable(&e) => return Err(()),
+            Err(_) => return Ok(None),
+        };
+    if matches!(resp.status().as_u16(), 502..=504) {
+        return Err(()); // the server is there but its backend is not answering
     }
-    let cr = resp.headers().get("content-range")?.to_str().ok()?.to_string();
-    let total = cr.rsplit('/').next()?.trim().parse::<u64>().ok().filter(|t| *t > 0)?;
-    Some((total, referer))
+    if resp.status().as_u16() != 206 {
+        return Ok(None);
+    }
+    let total = resp
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cr| cr.rsplit('/').next())
+        .and_then(|t| t.trim().parse::<u64>().ok())
+        .filter(|t| *t > 0);
+    Ok(total.map(|t| (t, referer)))
 }
 
-fn load_side(file: &Path, d: &Download) -> Option<Side> {
+/// The progress of an unfinished download. The link may have changed since ("Change link"):
+/// the file is still the same as long as its size is, which was checked when it changed.
+fn load_side(file: &Path) -> Option<Side> {
     let s: Side = serde_json::from_slice(&fs::read(side_path(file)).ok()?).ok()?;
     let len = fs::metadata(file).ok()?.len();
-    let ok = s.url == d.url && len == s.size && s.chunk > 0 && s.done.len() as u64 == s.size.div_ceil(s.chunk);
+    let ok = len == s.size && s.chunk > 0 && s.done.len() as u64 == s.size.div_ceil(s.chunk);
     ok.then_some(s)
 }
 
@@ -98,14 +114,25 @@ pub fn run(
     // The Referer to send with every part: the one the server accepted when asked first.
     let mut referer = crate::web::referer_choices(&d.url, d.extra.referer.as_deref()).into_iter().next().flatten();
     // Resume from the side file, or start fresh when the server allows ranges.
-    let mut side = match load_side(path, d) {
-        Some(s) => s,
+    let mut side = match load_side(path) {
+        Some(mut s) => {
+            if s.url != d.url {
+                let _ = ev_tx.send(EngineEvent::Log(d.id, "Continuing from the new link".into()));
+                s.url = d.url.clone();
+                save_side(path, &s);
+            }
+            s
+        }
         None => {
             // A leftover partial file without a side file belongs to the single path.
             if fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false) {
                 return Outcome::Fallback;
             }
-            let Some((total, accepted)) = probe_ranges(client, d) else { return Outcome::Fallback };
+            let (total, accepted) = match probe_ranges(client, d) {
+                Ok(Some(t)) => t,
+                Ok(None) => return Outcome::Fallback,
+                Err(()) => return Outcome::Unreachable,
+            };
             referer = accepted;
             if total < MIN_SIZE {
                 return Outcome::Fallback;
@@ -139,7 +166,12 @@ pub fn run(
     let alive = Arc::new(AtomicBool::new(true));
 
     let threads = CONNECTIONS.min(n);
-    let limit = Arc::new(Limit { allowed: AtomicUsize::new(threads), active: AtomicUsize::new(threads) });
+    let limit = Arc::new(Limit {
+        allowed: AtomicUsize::new(threads),
+        active: AtomicUsize::new(threads),
+        waiting: AtomicUsize::new(0),
+        noted: Mutex::new(None),
+    });
     let already = total_got.load(Ordering::Relaxed);
     let _ = ev_tx.send(EngineEvent::Log(
         d.id,
@@ -321,6 +353,8 @@ fn worker(
         let (start, end) = chunk_bounds(side, idx);
 
         let mut attempts = 0u32;
+        let mut waits = 0usize;
+        let mut waiting = false;
         loop {
             let have = done[idx].load(Ordering::Relaxed);
             if have >= end - start {
@@ -336,6 +370,31 @@ fn worker(
             if r.got > 0 {
                 // It moved on before the connection dropped: carry on from there.
                 attempts = 0;
+                waits = 0;
+                if waiting {
+                    waiting = false;
+                    limit.answered(ev, d.id);
+                }
+                continue;
+            }
+            // The server itself is not answering (down, or overloaded): fewer connections
+            // would not help. Wait, longer each time, for about ten minutes in all.
+            let server_trouble = r.unreachable || (matches!(r.refused, Some(500 | 502..=504)) && r.retry_after.is_none());
+            if server_trouble {
+                let Some(&secs) = crate::web::PATIENT_WAITS.get(waits) else {
+                    *failed.lock().unwrap() = Some(crate::web::NOT_ANSWERING.into());
+                    return false;
+                };
+                waits += 1;
+                if !waiting {
+                    waiting = true;
+                    limit.waiting.fetch_add(1, Ordering::SeqCst);
+                }
+                limit.not_answering(ev, d.id, secs);
+                let slept = nap(control, secs);
+                if slept.is_err() {
+                    return false;
+                }
                 continue;
             }
             // Refused or dropped before sending anything. Many sites allow only a few
@@ -379,14 +438,49 @@ fn worker(
 
 struct Stop;
 
+/// Sleep, but wake up at once when the download is stopped.
+fn nap(control: &AtomicU8, secs: u64) -> Result<(), Stop> {
+    let end = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < end {
+        if control.load(Ordering::SeqCst) == STOP {
+            return Err(Stop);
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    Ok(())
+}
+
 /// How many connections the site lets us use. It starts at CONNECTIONS and goes down each time
 /// a connection is refused or dropped before sending anything, down to one.
 struct Limit {
     allowed: AtomicUsize,
     active: AtomicUsize,
+    /// Connections waiting for a server that does not answer.
+    waiting: AtomicUsize,
+    /// When "not answering" was last written to the activity list (once is enough for all).
+    noted: Mutex<Option<Instant>>,
 }
 
 impl Limit {
+    /// Tell the app the server is not answering and when the next try is.
+    fn not_answering(&self, ev: &Sender<EngineEvent>, id: u64, secs: u64) {
+        let _ = ev.send(EngineEvent::Waiting(id, Some(secs)));
+        let mut n = self.noted.lock().unwrap();
+        if n.map(|t| t.elapsed() > Duration::from_secs(4)).unwrap_or(true) {
+            *n = Some(Instant::now());
+            let _ = ev.send(EngineEvent::Log(id, format!("The server is not answering, trying again in {} s", secs)));
+        }
+    }
+
+    /// One connection got data again.
+    fn answered(&self, ev: &Sender<EngineEvent>, id: u64) {
+        if self.waiting.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let _ = ev.send(EngineEvent::Waiting(id, None));
+            let _ = ev.send(EngineEvent::Log(id, "The server is answering again".into()));
+            *self.noted.lock().unwrap() = None;
+        }
+    }
+
     /// One fewer connection from now on (never below one). Returns the new number when it
     /// actually went down.
     fn lower(&self) -> Option<usize> {
@@ -420,6 +514,8 @@ struct Fetched {
     got: u64,
     /// The answer, when it was not a part (206).
     refused: Option<u16>,
+    /// No answer at all: could not connect, or it went silent.
+    unreachable: bool,
     /// The server asked to wait this many seconds.
     retry_after: Option<u64>,
 }
@@ -438,9 +534,15 @@ fn fetch(
     total_got: &AtomicU64,
     control: &AtomicU8,
 ) -> Result<Fetched, Stop> {
-    let mut out = Fetched { got: 0, refused: None, retry_after: None };
+    let mut out = Fetched { got: 0, refused: None, unreachable: false, retry_after: None };
     let req = part_request(client, d).header("Range", format!("bytes={}-{}", from, to));
-    let Ok(mut resp) = req.send() else { return Ok(out) };
+    let mut resp = match req.send() {
+        Ok(r) => r,
+        Err(e) => {
+            out.unreachable = crate::web::unreachable(&e);
+            return Ok(out);
+        }
+    };
     if resp.status().as_u16() != 206 {
         out.refused = Some(resp.status().as_u16());
         out.retry_after = resp
@@ -478,8 +580,13 @@ fn fetch(
                 chunk_done.fetch_add(n as u64, Ordering::Relaxed);
                 total_got.fetch_add(n as u64, Ordering::Relaxed);
                 out.got += n as u64;
+                crate::throttle::take(n);
             }
-            Err(_) => return Ok(out),
+            Err(e) => {
+                // Silent for too long: the server may be gone.
+                out.unreachable = e.kind() == std::io::ErrorKind::TimedOut;
+                return Ok(out);
+            }
         }
     }
 }
